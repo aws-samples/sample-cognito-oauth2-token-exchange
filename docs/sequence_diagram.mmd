@@ -1,0 +1,46 @@
+sequenceDiagram
+    autonumber
+    actor C as Client / Service<br/>(acts for user)
+    participant EI as External IdP<br/>(Cognito user pool)
+    participant AG as API Gateway<br/>/v1/token-exchange
+    participant AZ as Lambda authorizer
+    participant SSM as Parameter Store<br/>(client secrets)
+    participant TX as TokenExchange<br/>Lambda
+    participant SP as Service pool<br/>(Cognito)
+    participant PT as PreTokenGeneration<br/>trigger
+    participant DS as Downstream API
+
+    Note over C,EI: Phase 1 — user authenticates (once)
+    C->>EI: Authenticate user
+    EI-->>C: User access token
+
+    Note over C,SSM: Phase 2 — authorize the client
+    C->>AG: POST token-exchange<br/>(Basic client creds, subject_token = user token)
+    AG->>AZ: Validate client credentials
+    AZ->>SSM: Get client secret (5-min cache)
+    SSM-->>AZ: Secret
+    AZ-->>AG: Allow (IAM policy)
+
+    Note over AG,EI: Phase 3 — verify the user token
+    AG->>TX: Invoke with user token
+    TX->>EI: Fetch JWKS (aws-jwt-verify)
+    EI-->>TX: JWKS
+    alt signature / exp / aud invalid
+        TX-->>C: 401 — fail closed (no token issued)
+    end
+
+    Note over TX,SP: Phase 4 — mint the delegated token
+    TX->>SP: Custom auth flow<br/>(clientMetadata.OriginalUserToken)
+    SP->>PT: Invoke PreTokenGeneration
+    PT->>EI: Verify OriginalUserToken<br/>(clientMetadata is NOT validated by Cognito)
+    EI-->>PT: Valid
+    alt verification fails
+        PT-->>SP: throw — fail closed (no token issued)
+    end
+    PT-->>SP: Add custom:original_* claims + service scopes
+    SP-->>TX: Exchanged access token
+    TX-->>C: RFC 8693 response<br/>(access_token, token_type, expires_in)
+
+    Note over C,DS: Phase 5 — call downstream with least privilege
+    C->>DS: Call with exchanged token<br/>(sub = service, custom:original_sub = user)
+    DS-->>C: Response (per-user authz + full audit trail)
