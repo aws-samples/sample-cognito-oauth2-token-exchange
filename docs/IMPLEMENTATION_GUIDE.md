@@ -48,20 +48,40 @@ The service token contains:
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "DeploySampleResources",
       "Effect": "Allow",
       "Action": [
         "cognito-idp:*",
         "lambda:*",
         "apigateway:*",
         "cloudformation:*",
-        "iam:*",
-        "s3:*"
+        "ssm:*",
+        "logs:*",
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:TagRole",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "PassExecutionRoleToLambdaOnly",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::*:role/<your-stack-name>-*",
+      "Condition": {
+        "StringEquals": { "iam:PassedToService": "lambda.amazonaws.com" }
+      }
     }
   ]
 }
 ```
+
+> These are broad deployment permissions provided for convenience. In production, scope each `Resource` to specific ARNs and tighten the service actions further. Note that `iam:*` is avoided and `iam:PassRole` is restricted to the Lambda service via the `iam:PassedToService` condition, so no role can be passed to an unintended service.
 
 ## 🚀 Step-by-Step Implementation
 
