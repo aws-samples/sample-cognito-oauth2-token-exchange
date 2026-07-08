@@ -137,13 +137,15 @@ event.response.answerCorrect = true;
 **Purpose**: Adds user claims and service scopes to the exchanged token
 
 **Key Functions**:
-- Extracts claims from original user token
+- Verifies the original user token with `aws-jwt-verify`, then extracts its claims
 - Adds service-specific scopes
 - Suppresses default Cognito scopes
 
 ```javascript
-// Key code snippet
-const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64').toString());
+// Key code snippet — verify before trusting claims.
+// clientMetadata is caller-supplied and is NOT validated by Cognito, so the
+// token is cryptographically verified with aws-jwt-verify (fail closed on error).
+const payload = await verifier.verify(originalToken);
 
 event.response.claimsAndScopeOverrideDetails = {
   accessTokenGeneration: {

@@ -2,6 +2,6 @@
   "name": "jwt-verify-layer",
   "version": "1.0.0",
   "dependencies": {
-    "aws-jwt-verify": "^4.0.0"
+    "aws-jwt-verify": "^5.2.1"
   }
 }

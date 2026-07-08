@@ -4,6 +4,7 @@
     "module": "commonjs",
     "lib": ["ES2020"],
     "declaration": true,
+    "skipLibCheck": true,
     "strict": true,
     "noImplicitAny": true,
     "strictNullChecks": true,

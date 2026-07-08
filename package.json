@@ -23,8 +23,7 @@
     "url": "https://github.com/aws-samples/sample-cognito-oauth2-token-exchange"
   },
   "dependencies": {
-    "@aws-sdk/client-cloudformation": "^3.848.0",
-    "@aws-sdk/client-cognito-identity-provider": "^3.848.0"
-  },
-  "devDependencies": {}
+    "@aws-sdk/client-cloudformation": "^3.1081.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.1081.0"
+  }
 }

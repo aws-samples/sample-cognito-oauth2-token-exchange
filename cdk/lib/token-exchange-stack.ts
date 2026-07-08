@@ -49,6 +49,18 @@ export class TokenExchangeStack extends cdk.Stack {
           'Resource::<StoreClientSecret52339365.Arn>:*',
         ],
       },
+      {
+        id: 'AwsSolutions-COG8',
+        reason: 'Cognito advanced security (Plus tier / threat protection) is an optional paid feature. This sample needs only the Essentials feature plan for access-token customization; Plus-tier threat protection is a customer cost decision, out of scope for demonstrating token exchange.',
+      },
+      {
+        id: 'AwsSolutions-COG2',
+        reason: 'MFA is intentionally not required on the sample user pools to keep the token-exchange demonstration friction-free. Enable MFA in production deployments.',
+      },
+      {
+        id: 'AwsSolutions-APIG3',
+        reason: 'A WAFv2 web ACL is production hardening (added cost/complexity) not required to demonstrate the token-exchange flow. Associate a WAFv2 web ACL with the API stage in production.',
+      },
     ]);
 
     // ========================================
@@ -345,6 +357,16 @@ export class TokenExchangeStack extends cdk.Stack {
       handler: 'index.handler',
       logGroup: sharedLogGroup,
       code: lambda.Code.fromInline(`
+        const { CognitoJwtVerifier } = require('aws-jwt-verify');
+
+        // Verifier for the EXTERNAL IdP that issued the user's (subject) token.
+        // aws-jwt-verify caches the IdP JWKS after the first fetch.
+        const verifier = CognitoJwtVerifier.create({
+          userPoolId: process.env.EXTERNAL_USER_POOL_ID,
+          tokenUse: "access",
+          clientId: process.env.EXTERNAL_CLIENT_ID,
+        });
+
         exports.handler = async (event, context) => {
           console.log('Pre-token generation V2_0 event:', JSON.stringify(event, null, 2));
           
@@ -361,15 +383,13 @@ export class TokenExchangeStack extends cdk.Stack {
               
               console.log('Token exchange detected - extracting claims from original user token');
               
+              // SECURITY: clientMetadata is caller-supplied and is NOT validated by
+              // Cognito. Cryptographically verify the token (signature, expiry,
+              // audience) before trusting any claim. On failure verify() throws,
+              // which aborts token issuance (fail closed) - see catch block below.
               const originalToken = event.request.clientMetadata.OriginalUserToken;
-              const tokenParts = originalToken.split('.');
-              
-              if (tokenParts.length !== 3) {
-                throw new Error('Invalid JWT token format');
-              }
-              
-              const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64').toString());
-              console.log('Extracted user claims from original token:', JSON.stringify(payload, null, 2));
+              const payload = await verifier.verify(originalToken);
+              console.log('Verified original user token for sub:', payload.sub);
               
               const serviceScopes = [
                 'read:user-profile',
@@ -402,15 +422,21 @@ export class TokenExchangeStack extends cdk.Stack {
             }
             
           } catch (error) {
-            console.error('Pre-token generation error:', error);
+            // Fail closed: if verification or claim enrichment fails, do NOT issue a
+            // token. Re-throwing aborts token generation.
+            console.error('Pre-token generation error (failing closed):', error);
+            throw error;
           }
           
           console.log('Pre-token generation V2_0 completed');
           return event;
         };
       `),
+      layers: [jwtVerifyLayer],
       environment: {
         ENABLE_DELEGATION_CLAIMS: enableDelegationClaims ? 'true' : 'false',
+        EXTERNAL_USER_POOL_ID: externalIdpUserPool.userPoolId,
+        EXTERNAL_CLIENT_ID: externalIdpClient.userPoolClientId,
       },
       timeout: cdk.Duration.seconds(30),
     });
@@ -488,6 +514,7 @@ export class TokenExchangeStack extends cdk.Stack {
       logGroup: sharedLogGroup,
       code: lambda.Code.fromInline(`
         const { CognitoIdentityProviderClient, AdminCreateUserCommand, AdminSetUserPasswordCommand, AdminGetUserCommand } = require('@aws-sdk/client-cognito-identity-provider');
+        const crypto = require('crypto');
         const https = require('https');
         const url = require('url');
         
@@ -510,7 +537,7 @@ export class TokenExchangeStack extends cdk.Stack {
             
             for (let i = 1; i <= numIdentities; i++) {
               const username = \`service-\${i}@tokenexchange.local\`;
-              const tempPassword = \`TempPass\${i}!\${Math.random().toString(36).substring(7)}\`;
+              const tempPassword = \`TempPass\${i}!\${crypto.randomBytes(16).toString('hex')}\`;
               
               try {
                 await cognitoClient.send(new AdminGetUserCommand({
@@ -532,7 +559,7 @@ export class TokenExchangeStack extends cdk.Stack {
                     MessageAction: 'SUPPRESS'
                   }));
                   
-                  const permanentPassword = \`ServicePass\${i}!\${Math.random().toString(36).substring(7)}\`;
+                  const permanentPassword = \`ServicePass\${i}!\${crypto.randomBytes(16).toString('hex')}\`;
                   await cognitoClient.send(new AdminSetUserPasswordCommand({
                     UserPoolId: userPoolId,
                     Username: username,
