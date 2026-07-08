@@ -1,0 +1,1414 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'OAuth 2.0 Token Exchange implementation using Cognito custom authentication flows'
+
+Parameters:
+  EnableDelegationClaims:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      Set to false to disable PreTokenGeneration enrichment of delegation claims.
+      When false, the exchanged token will be a standard Cognito token without
+      original user identity claims or custom service scopes.
+
+  LambdaLayerBucket:
+    Type: String
+    Description: >-
+      S3 bucket containing the jwt-verify.zip Lambda layer artifact.
+      The deploy script passes this as --parameter-overrides so the bucket name
+      (which must be lowercase) can differ from the stack name.
+
+Resources:
+  # External IDP User Pool (represents different identity provider)
+  # This represents the original system that issues tokens to users
+  ExternalIdpUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: external-idp-user-pool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: given_name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: family_name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+
+  # External IDP Client - Users authenticate with this client in the external IDP
+  ExternalIdpUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref ExternalIdpUserPool
+      ClientName: external-idp-client
+      GenerateSecret: false  # Public client for user authentication
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      ReadAttributes:
+        - email
+        - given_name
+        - family_name
+      WriteAttributes:
+        - email
+        - given_name
+        - family_name
+
+  # Create a test user in the external IDP for testing
+  ExternalIdpUserPoolUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref ExternalIdpUserPool
+      Username: testuser@example.com
+      UserAttributes:
+        - Name: email
+          Value: testuser@example.com
+        - Name: email_verified
+          Value: 'true'
+        - Name: given_name
+          Value: Test
+        - Name: family_name
+          Value: User
+      MessageAction: SUPPRESS
+
+  # Lambda Layer for JWT verification
+  JwtVerifyLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: jwt-verify-layer
+      Description: 'AWS JWT Verify library for token validation'
+      Content:
+        S3Bucket: !Ref LambdaLayerBucket
+        S3Key: 'jwt-verify.zip'
+      CompatibleRuntimes:
+        - nodejs22.x
+
+  # KMS Key for CloudWatch Logs encryption
+  LogsKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for CloudWatch Logs encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  LogsKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-logs-key'
+      TargetKeyId: !Ref LogsKmsKey
+
+  # Shared CloudWatch Log Group for all Lambda functions
+  # Using a single log group simplifies querying across the token exchange flow
+  # and reduces IAM complexity. Log streams include function name for filtering.
+  SharedLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
+
+  # Separate log group for API Gateway access logs
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${AWS::StackName}-access-logs'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
+
+  # IAM Roles for Lambda functions
+  DefineAuthChallengeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LoggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}:*"
+
+  CreateAuthChallengeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LoggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}:*"
+
+  VerifyAuthChallengeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LoggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}:*"
+
+  TokenExchangeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LoggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}:*"
+
+  AuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LoggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}:*"
+        - PolicyName: SSMPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/service-client-secret'
+
+  # Pre-Token Generation Lambda Role
+  PreTokenGenerationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LoggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}:*"
+
+  # Lambda Functions (created first, without User Pool references)
+  DefineAuthChallengeFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SharedLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-DefineAuthChallenge'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt DefineAuthChallengeRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref SharedLogGroup
+      Code:
+        ZipFile: |
+          exports.handler = async (event, context) => {
+            console.log('Define Auth Challenge event:', JSON.stringify(event, null, 2));
+            
+            if (event.request.session.length === 0) {
+              // First challenge - set custom challenge
+              event.response.challengeName = 'CUSTOM_CHALLENGE';
+              event.response.issueTokens = false;
+            } else if (event.request.session.length === 1 && 
+                       event.request.session[0].challengeName === 'CUSTOM_CHALLENGE' &&
+                       event.request.session[0].challengeResult === true) {
+              // Challenge passed - issue tokens
+              event.response.issueTokens = true;
+            } else {
+              // Challenge failed
+              event.response.issueTokens = false;
+            }
+            
+            return event;
+          };
+      Environment:
+        Variables:
+          NODE_OPTIONS: '--enable-source-maps'
+      Timeout: 30
+
+  CreateAuthChallengeFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SharedLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-CreateAuthChallenge'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt CreateAuthChallengeRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref SharedLogGroup
+      Code:
+        ZipFile: |
+          exports.handler = async (event, context) => {
+            console.log('Create Auth Challenge event:', JSON.stringify(event, null, 2));
+            
+            if (event.request.challengeName === 'CUSTOM_CHALLENGE') {
+              // Create a challenge that expects an access token
+              event.response.publicChallengeParameters = {
+                challenge: 'Provide your access token for verification'
+              };
+              event.response.privateChallengeParameters = {
+                expectedAnswer: 'ACCESS_TOKEN'
+              };
+            }
+            
+            return event;
+          };
+      Environment:
+        Variables:
+          NODE_OPTIONS: '--enable-source-maps'
+      Timeout: 30
+
+  VerifyAuthChallengeFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SharedLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-VerifyAuthChallenge'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt VerifyAuthChallengeRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref SharedLogGroup
+      Layers:
+        - !Ref JwtVerifyLayer
+      Code:
+        ZipFile: |
+          const { CognitoJwtVerifier } = require('aws-jwt-verify');
+          
+          const verifier = CognitoJwtVerifier.create({
+            userPoolId: process.env.EXTERNAL_USER_POOL_ID,
+            tokenUse: "access",
+            clientId: process.env.EXTERNAL_CLIENT_ID,
+          });
+          
+          exports.handler = async (event, context) => {
+            console.log('Verify Auth Challenge event:', JSON.stringify(event, null, 2));
+            
+            try {
+              // Get the user token from the challenge answer
+              const userToken = event.request.challengeAnswer;
+              console.log('Attempting to verify user token...');
+              
+              // Verify the user token using aws-jwt-verify
+              const payload = await verifier.verify(userToken);
+              console.log('User token verified successfully:', JSON.stringify(payload, null, 2));
+              
+              // Set challenge result to success
+              event.response.answerCorrect = true;
+              console.log('Set answerCorrect = true');
+              
+            } catch (error) {
+              console.error('Token verification failed:', error);
+              event.response.answerCorrect = false;
+              console.log('Set answerCorrect = false due to verification failure');
+            }
+            
+            console.log('Returning event with answerCorrect =', event.response.answerCorrect);
+            return event;
+          };
+      Environment:
+        Variables:
+          NODE_OPTIONS: '--enable-source-maps'
+          EXTERNAL_USER_POOL_ID: !Ref ExternalIdpUserPool
+          EXTERNAL_CLIENT_ID: !Ref ExternalIdpUserPoolClient
+      Timeout: 30
+
+  # Pre-Token Generation Lambda Function
+  PreTokenGenerationFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SharedLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-PreTokenGeneration'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt PreTokenGenerationRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref SharedLogGroup
+      Timeout: 30
+      Environment:
+        Variables:
+          ENABLE_DELEGATION_CLAIMS: !Ref EnableDelegationClaims
+      Code:
+        ZipFile: |
+          exports.handler = async (event, context) => {
+            console.log('Pre-token generation V2_0 event:', JSON.stringify(event, null, 2));
+            
+            // Skip claim enrichment if delegation claims are disabled
+            if (process.env.ENABLE_DELEGATION_CLAIMS === 'false') {
+              console.log('Delegation claims disabled - passing through without modification');
+              return event;
+            }
+            
+            try {
+              // Check if this is a token exchange request via ClientMetadata
+              if (event.request.clientMetadata && 
+                  event.request.clientMetadata.TokenExchange === 'true' && 
+                  event.request.clientMetadata.OriginalUserToken) {
+                
+                console.log('Token exchange detected - extracting claims from original user token');
+                
+                // Decode the original user token to extract claims
+                const originalToken = event.request.clientMetadata.OriginalUserToken;
+                const tokenParts = originalToken.split('.');
+                
+                if (tokenParts.length !== 3) {
+                  throw new Error('Invalid JWT token format');
+                }
+                
+                // Decode the payload (second part of JWT)
+                const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64').toString());
+                console.log('Extracted user claims from original token:', JSON.stringify(payload, null, 2));
+                
+                // Define service-specific scopes for the service client identity
+                const serviceScopes = [
+                  'read:user-profile',
+                  'read:user-permissions', 
+                  'write:audit-logs',
+                  'access:downstream-apis'
+                ];
+                
+                // V2_0 allows modification of access tokens via claimsAndScopeOverrideDetails
+                event.response.claimsAndScopeOverrideDetails = {
+                  accessTokenGeneration: {
+                    claimsToAddOrOverride: {
+                      // Original user identity claims (prefixed to avoid conflicts)
+                      'custom:original_sub': payload.sub,
+                      'custom:original_username': payload.username || payload.sub,
+                      'custom:original_client_id': payload.client_id,
+                      'custom:original_iss': payload.iss,
+                      'custom:original_scope': payload.scope,
+                      'custom:original_auth_time': payload.auth_time?.toString(),
+                      
+                      // Service-specific claims
+                      'custom:token_exchange': 'true',
+                      'custom:service_identity': event.userName, // Use the actual service identity user
+                      'custom:service_scopes': serviceScopes.join(' ')
+                    },
+                    scopesToAdd: serviceScopes,
+                    scopesToSuppress: ['aws.cognito.signin.user.admin'] // Remove default scope
+                  }
+                };
+                
+                console.log('Claims and scope override details:', JSON.stringify(event.response.claimsAndScopeOverrideDetails, null, 2));
+              } else {
+                console.log('Not a token exchange request - no modifications applied');
+              }
+              
+            } catch (error) {
+              console.error('Pre-token generation error:', error);
+              // Don't fail the token generation, just log the error
+            }
+            
+            console.log('Pre-token generation V2_0 completed');
+            return event;
+          };
+
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SharedLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-Authorizer'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt AuthorizerRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref SharedLogGroup
+      Code:
+        ZipFile: |
+          const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
+          
+          const ssmClient = new SSMClient({ region: process.env.AWS_REGION });
+          
+          // Cache for client credentials with TTL
+          let clientCredentials = null;
+          let cacheExpiry = 0;
+          const CACHE_TTL = 300000; // 5 minutes in milliseconds
+          
+          async function getClientCredentials() {
+            const now = Date.now();
+            
+            // Return cached credentials if still valid
+            if (clientCredentials && now < cacheExpiry) {
+              console.log('Using cached credentials (TTL remaining:', Math.floor((cacheExpiry - now) / 1000), 'seconds)');
+              return clientCredentials;
+            }
+            
+            try {
+              console.log('Fetching credentials from SSM Parameter Store');
+              const command = new GetParameterCommand({
+                Name: process.env.CLIENT_SECRET_PARAMETER
+              });
+              const response = await ssmClient.send(command);
+              
+              clientCredentials = JSON.parse(response.Parameter.Value);
+              cacheExpiry = now + CACHE_TTL;
+              
+              console.log('Credentials fetched and cached for 5 minutes');
+              return clientCredentials;
+            } catch (error) {
+              console.error('Failed to retrieve client credentials from SSM:', error);
+              throw error;
+            }
+          }
+          
+          exports.handler = async (event, context) => {
+            console.log('Authorizer event:', JSON.stringify(event, null, 2));
+            
+            // Helper to get header case-insensitively
+            const getHeader = (name) => {
+              const lower = name.toLowerCase();
+              for (const key of Object.keys(event.headers || {})) {
+                if (key.toLowerCase() === lower) return event.headers[key];
+              }
+              return null;
+            };
+            
+            try {
+              // Validate request format (RFC 8693 compliance)
+              const contentType = getHeader('Content-Type');
+              if (event.httpMethod !== "POST" || 
+                  !contentType || 
+                  contentType !== "application/x-www-form-urlencoded") {
+                console.log('Method or content type check failed');
+                console.log('Method:', event.httpMethod);
+                console.log('Content-Type:', contentType);
+                return generatePolicy('user', 'Deny', event.methodArn);
+              }
+              
+              // Check for Basic Authentication header
+              const authHeaderValue = getHeader('Authorization');
+              if (!authHeaderValue || !authHeaderValue.startsWith("Basic ")) {
+                console.log('Authorization header check failed');
+                console.log('Authorization header:', authHeaderValue);
+                return generatePolicy('user', 'Deny', event.methodArn);
+              }
+              
+              // Extract Basic Auth credentials
+              const authHeader = authHeaderValue.substring(6); // Remove "Basic "
+              const credentials = Buffer.from(authHeader, 'base64').toString('utf-8');
+              const [clientId, clientSecret] = credentials.split(':');
+              
+              console.log('Extracted clientId:', clientId);
+              
+              // Get the real client credentials from SSM Parameter Store
+              const realCredentials = await getClientCredentials();
+              console.log('Expected clientId from SSM:', realCredentials.clientId);
+              
+              // Validate service client credentials
+              if (clientId === realCredentials.clientId && clientSecret === realCredentials.clientSecret) {
+                console.log('Authorization successful - delegation enabled');
+                return generatePolicy(clientId, 'Allow', event.methodArn);
+              } else {
+                console.log('Credential validation failed');
+                return generatePolicy('user', 'Deny', event.methodArn);
+              }
+              
+            } catch (error) {
+              console.error('Authorizer error:', error);
+              return generatePolicy('user', 'Deny', event.methodArn);
+            }
+          };
+          
+          function generatePolicy(principalId, effect, resource) {
+            const policy = {
+              principalId: principalId,
+              policyDocument: {
+                Version: '2012-10-17',
+                Statement: [
+                  {
+                    Action: 'execute-api:Invoke',
+                    Effect: effect,
+                    Resource: resource
+                  }
+                ]
+              }
+            };
+            
+            console.log('Generated policy:', JSON.stringify(policy, null, 2));
+            return policy;
+          }
+      Environment:
+        Variables:
+          CLIENT_SECRET_PARAMETER: !Sub '/${AWS::StackName}/service-client-secret'
+      Timeout: 30
+
+  TokenExchangeFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SharedLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-TokenExchange'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt TokenExchangeLambdaRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref SharedLogGroup
+      Layers:
+        - !Ref JwtVerifyLayer
+      Code:
+        ZipFile: |
+          const { CognitoIdentityProviderClient, AdminInitiateAuthCommand, AdminRespondToAuthChallengeCommand } = require('@aws-sdk/client-cognito-identity-provider');
+          const { CognitoJwtVerifier } = require('aws-jwt-verify');
+          
+          const cognitoClient = new CognitoIdentityProviderClient({ region: process.env.AWS_REGION });
+          
+          const verifier = CognitoJwtVerifier.create({
+            userPoolId: process.env.EXTERNAL_USER_POOL_ID,
+            tokenUse: "access",
+            clientId: process.env.EXTERNAL_CLIENT_ID,
+          });
+          
+          function parseFormBody(body) {
+            const params = new URLSearchParams(body);
+            const result = {};
+            for (const [key, value] of params) {
+              result[key] = value;
+            }
+            return result;
+          }
+          
+          exports.handler = async (event) => {
+            console.log('Token exchange event:', JSON.stringify(event, null, 2));
+            // Updated: 2025-07-21 - Removed SECRET_HASH requirement for admin operations
+            
+            try {
+              const body = parseFormBody(event.body);
+              
+              // Validate OAuth 2.0 Token Exchange parameters
+              if (body.grant_type !== "urn:ietf:params:oauth:grant-type:token-exchange" ||
+                  body.subject_token_type !== "urn:ietf:params:oauth:token-type:access_token") {
+                return {
+                  statusCode: 400,
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                  },
+                  body: JSON.stringify({
+                    error: 'unsupported_grant_type',
+                    error_description: 'Only token exchange grant type is supported'
+                  }),
+                };
+              }
+              
+              // Verify Client A's access token (subject_token)
+              let payload;
+              try {
+                payload = await verifier.verify(body.subject_token);
+              } catch (error) {
+                console.error('Token verification failed:', error);
+                return {
+                  statusCode: 401,
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                  },
+                  body: JSON.stringify({
+                    error: 'invalid_grant',
+                    error_description: 'The provided subject token is invalid or expired'
+                  }),
+                };
+              }
+              
+              // Use the admin client (without secret) for the custom auth flow
+              // Authenticate as one of the service client identities using round-robin
+              // This distributes load across 24 service identities to support 120 TPS
+              // (24 identities × 5 TPS per user = 120 TPS)
+              const serviceIdentityIndex = Math.floor(Math.random() * 24);
+              const serviceUsername = `service-${serviceIdentityIndex + 1}@tokenexchange.local`;
+              
+              console.log(`Using service identity: ${serviceUsername}`);
+              
+              // Initiate custom auth flow for the service client identity
+              const authCommand = new AdminInitiateAuthCommand({
+                AuthFlow: 'CUSTOM_AUTH',
+                ClientId: process.env.ADMIN_CLIENT_ID,
+                UserPoolId: process.env.USER_POOL_ID,
+                AuthParameters: {
+                  USERNAME: serviceUsername,
+                },
+                ClientMetadata: {
+                  Step: 'AT_CHALLENGE',
+                  UserClaims: JSON.stringify({
+                    sub: payload.sub,
+                    username: payload.username,
+                    client_id: payload.client_id,
+                    iss: payload.iss
+                  })
+                }
+              });
+              
+              const authResponse = await cognitoClient.send(authCommand);
+              
+              // Respond to the auth challenge with the original access token
+              const challengeCommand = new AdminRespondToAuthChallengeCommand({
+                ChallengeName: authResponse.ChallengeName,
+                ClientId: process.env.ADMIN_CLIENT_ID,
+                UserPoolId: process.env.USER_POOL_ID,
+                Session: authResponse.Session,
+                ChallengeResponses: {
+                  USERNAME: serviceUsername,
+                  ANSWER: body.subject_token
+                },
+                ClientMetadata: {
+                  OriginalUserToken: body.subject_token,
+                  TokenExchange: 'true'
+                }
+              });
+              
+              const challengeResponse = await cognitoClient.send(challengeCommand);
+              
+              return {
+                statusCode: 200,
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                },
+                body: JSON.stringify({
+                  access_token: challengeResponse.AuthenticationResult.AccessToken,
+                  token_type: 'Bearer',
+                  expires_in: challengeResponse.AuthenticationResult.ExpiresIn,
+                  issued_token_type: 'urn:ietf:params:oauth:token-type:access_token'
+                }),
+              };
+              
+            } catch (error) {
+              console.error('Token exchange error:', error);
+              return {
+                statusCode: 500,
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                },
+                body: JSON.stringify({
+                  error: 'server_error',
+                  error_description: 'Internal server error during token exchange'
+                }),
+              };
+            }
+          };
+      Environment:
+        Variables:
+          EXTERNAL_USER_POOL_ID: !Ref ExternalIdpUserPool
+          EXTERNAL_CLIENT_ID: !Ref ExternalIdpUserPoolClient
+          USER_POOL_ID: !Ref TokenExchangeUserPool
+          ADMIN_CLIENT_ID: !Ref AdminClientWithoutSecret
+      Timeout: 30
+
+  # Cognito User Pool (created after Lambda functions)
+  TokenExchangeUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: oauth2-token-exchange-pool
+      AutoVerifiedAttributes: []
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      LambdaConfig:
+        DefineAuthChallenge: !GetAtt DefineAuthChallengeFunction.Arn
+        CreateAuthChallenge: !GetAtt CreateAuthChallengeFunction.Arn
+        VerifyAuthChallengeResponse: !GetAtt VerifyAuthChallengeFunction.Arn
+        PreTokenGeneration: !GetAtt PreTokenGenerationFunction.Arn
+        PreTokenGenerationConfig:
+          LambdaVersion: V2_0
+          LambdaArn: !GetAtt PreTokenGenerationFunction.Arn
+    DependsOn:
+      - DefineAuthChallengeFunction
+      - CreateAuthChallengeFunction
+      - VerifyAuthChallengeFunction
+      - PreTokenGenerationFunction
+
+  # Service Client (with secret) - Used by external services for API Gateway authentication
+  ServiceClientWithSecret:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref TokenExchangeUserPool
+      ClientName: service-client-with-secret
+      GenerateSecret: true
+      ExplicitAuthFlows:
+        - ALLOW_CUSTOM_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # Admin Client (without secret) - Used by Lambda for AdminInitiateAuth
+  AdminClientWithoutSecret:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref TokenExchangeUserPool
+      ClientName: admin-client-without-secret
+      GenerateSecret: false  # No secret needed for admin operations
+      ExplicitAuthFlows:
+        - ALLOW_CUSTOM_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # Lambda Role for creating service identity users
+  CreateServiceIdentitiesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CognitoAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminGetUser
+                Resource: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${TokenExchangeUserPool}'
+
+  # Lambda function to create 24 service identity users for load distribution
+  CreateServiceIdentitiesFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SharedLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-CreateServiceIdentities'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt CreateServiceIdentitiesRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref SharedLogGroup
+      Timeout: 300
+      Code:
+        ZipFile: |
+          const { CognitoIdentityProviderClient, AdminCreateUserCommand, AdminSetUserPasswordCommand, AdminGetUserCommand } = require('@aws-sdk/client-cognito-identity-provider');
+          const https = require('https');
+          const url = require('url');
+          
+          const cognitoClient = new CognitoIdentityProviderClient({ region: process.env.AWS_REGION });
+          
+          exports.handler = async (event, context) => {
+            console.log('Creating service identity users:', JSON.stringify(event, null, 2));
+            
+            if (event.RequestType === 'Delete') {
+              console.log('Delete request - returning success');
+              await sendResponse(event, context, 'SUCCESS', 'Delete completed');
+              return;
+            }
+            
+            try {
+              const userPoolId = event.ResourceProperties.UserPoolId;
+              const numIdentities = 24; // 24 × 5 TPS = 120 TPS
+              
+              console.log(`Creating ${numIdentities} service identity users...`);
+              
+              for (let i = 1; i <= numIdentities; i++) {
+                const username = `service-${i}@tokenexchange.local`;
+                const tempPassword = `TempPass${i}!${Math.random().toString(36).substring(7)}`;
+                
+                try {
+                  // Check if user exists
+                  await cognitoClient.send(new AdminGetUserCommand({
+                    UserPoolId: userPoolId,
+                    Username: username
+                  }));
+                  console.log(`User ${username} already exists, skipping creation`);
+                } catch (error) {
+                  if (error.name === 'UserNotFoundException') {
+                    // Create user
+                    console.log(`Creating user ${username}...`);
+                    await cognitoClient.send(new AdminCreateUserCommand({
+                      UserPoolId: userPoolId,
+                      Username: username,
+                      UserAttributes: [
+                        { Name: 'email', Value: username },
+                        { Name: 'email_verified', Value: 'true' }
+                      ],
+                      TemporaryPassword: tempPassword,
+                      MessageAction: 'SUPPRESS'
+                    }));
+                    
+                    // Set permanent password
+                    const permanentPassword = `ServicePass${i}!${Math.random().toString(36).substring(7)}`;
+                    await cognitoClient.send(new AdminSetUserPasswordCommand({
+                      UserPoolId: userPoolId,
+                      Username: username,
+                      Password: permanentPassword,
+                      Permanent: true
+                    }));
+                    console.log(`Created user ${username}`);
+                  } else {
+                    throw error;
+                  }
+                }
+              }
+              
+              console.log(`Successfully created/verified ${numIdentities} service identity users`);
+              await sendResponse(event, context, 'SUCCESS', `Created ${numIdentities} service identities`);
+              
+            } catch (error) {
+              console.error('Error creating service identities:', error);
+              await sendResponse(event, context, 'FAILED', error.message);
+            }
+          };
+          
+          async function sendResponse(event, context, status, reason) {
+            const responseBody = JSON.stringify({
+              Status: status,
+              Reason: reason || 'See CloudWatch logs',
+              PhysicalResourceId: context.logStreamName,
+              StackId: event.StackId,
+              RequestId: event.RequestId,
+              LogicalResourceId: event.LogicalResourceId,
+              Data: { Message: reason }
+            });
+            
+            const parsedUrl = url.parse(event.ResponseURL);
+            const options = {
+              hostname: parsedUrl.hostname,
+              port: 443,
+              path: parsedUrl.path,
+              method: 'PUT',
+              headers: {
+                'content-type': '',
+                'content-length': responseBody.length
+              }
+            };
+            
+            return new Promise((resolve, reject) => {
+              const request = https.request(options, () => resolve());
+              request.on('error', reject);
+              request.write(responseBody);
+              request.end();
+            });
+          }
+
+  # Custom resource to create service identities
+  CreateServiceIdentitiesCustomResource:
+    Type: Custom::CreateServiceIdentities
+    Properties:
+      ServiceToken: !GetAtt CreateServiceIdentitiesFunction.Arn
+      UserPoolId: !Ref TokenExchangeUserPool
+    DependsOn:
+      - TokenExchangeUserPool
+
+  # SSM Parameter Store for Service Client Secret
+  ServiceClientSecretParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${AWS::StackName}/service-client-secret'
+      Description: 'Service Client credentials for token exchange (stored by Custom Resource)'
+      Type: String
+      Tier: Standard
+      Value: '{"clientId":"placeholder","clientSecret":"placeholder"}'
+
+  # Custom Resource Lambda Role - Fetches secret from Cognito and stores in SSM
+  StoreClientSecretRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CognitoAndSSMAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:DescribeUserPoolClient
+                Resource: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${TokenExchangeUserPool}'
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/service-client-secret'
+
+  # Custom Resource Lambda - Fetches Cognito secret and stores in SSM
+  StoreClientSecretFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SharedLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-StoreClientSecret'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt StoreClientSecretRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref SharedLogGroup
+      Timeout: 60
+      Code:
+        ZipFile: |
+          const { CognitoIdentityProviderClient, DescribeUserPoolClientCommand } = require('@aws-sdk/client-cognito-identity-provider');
+          const { SSMClient, PutParameterCommand } = require('@aws-sdk/client-ssm');
+          const https = require('https');
+          const url = require('url');
+          
+          exports.handler = async (event, context) => {
+            console.log('Custom Resource event:', JSON.stringify(event, null, 2));
+            
+            // Handle Delete - just return success
+            if (event.RequestType === 'Delete') {
+              console.log('Delete request - returning success');
+              await sendResponse(event, context, 'SUCCESS', 'Delete completed');
+              return;
+            }
+            
+            try {
+              const cognitoClient = new CognitoIdentityProviderClient({ region: process.env.AWS_REGION });
+              const ssmClient = new SSMClient({ region: process.env.AWS_REGION });
+              
+              console.log('Fetching client secret from Cognito...');
+              console.log('UserPoolId:', event.ResourceProperties.UserPoolId);
+              console.log('ClientId:', event.ResourceProperties.ClientId);
+              
+              // Fetch the client secret from Cognito (one-time during deployment)
+              const describeCommand = new DescribeUserPoolClientCommand({
+                UserPoolId: event.ResourceProperties.UserPoolId,
+                ClientId: event.ResourceProperties.ClientId
+              });
+              const cognitoResponse = await cognitoClient.send(describeCommand);
+              
+              if (!cognitoResponse.UserPoolClient.ClientSecret) {
+                throw new Error('Client secret not found - ensure GenerateSecret is true');
+              }
+              
+              console.log('Client secret retrieved successfully');
+              
+              // Store in SSM Parameter Store
+              const secretValue = JSON.stringify({
+                clientId: cognitoResponse.UserPoolClient.ClientId,
+                clientSecret: cognitoResponse.UserPoolClient.ClientSecret
+              });
+              
+              console.log('Storing credentials in SSM Parameter Store...');
+              const putCommand = new PutParameterCommand({
+                Name: event.ResourceProperties.ParameterName,
+                Value: secretValue,
+                Type: 'String',
+                Overwrite: true,
+                Description: 'Service client credentials for OAuth 2.0 token exchange'
+              });
+              await ssmClient.send(putCommand);
+              
+              console.log('Credentials stored successfully in SSM');
+              await sendResponse(event, context, 'SUCCESS', 'Client secret stored in SSM Parameter Store');
+              
+            } catch (error) {
+              console.error('Error storing client secret:', error);
+              await sendResponse(event, context, 'FAILED', error.message);
+            }
+          };
+          
+          async function sendResponse(event, context, status, reason) {
+            const responseBody = JSON.stringify({
+              Status: status,
+              Reason: reason || 'See CloudWatch logs',
+              PhysicalResourceId: context.logStreamName,
+              StackId: event.StackId,
+              RequestId: event.RequestId,
+              LogicalResourceId: event.LogicalResourceId,
+              Data: {
+                Message: reason
+              }
+            });
+            
+            console.log('Sending response to CloudFormation:', responseBody);
+            
+            const parsedUrl = url.parse(event.ResponseURL);
+            const options = {
+              hostname: parsedUrl.hostname,
+              port: 443,
+              path: parsedUrl.path,
+              method: 'PUT',
+              headers: {
+                'content-type': '',
+                'content-length': responseBody.length
+              }
+            };
+            
+            return new Promise((resolve, reject) => {
+              const request = https.request(options, (response) => {
+                console.log('CloudFormation response status:', response.statusCode);
+                resolve();
+              });
+              request.on('error', (error) => {
+                console.error('Error sending response to CloudFormation:', error);
+                reject(error);
+              });
+              request.write(responseBody);
+              request.end();
+            });
+          }
+
+  # Custom Resource - Triggers the Lambda to store the secret
+  StoreClientSecretCustomResource:
+    Type: Custom::StoreClientSecret
+    Properties:
+      ServiceToken: !GetAtt StoreClientSecretFunction.Arn
+      UserPoolId: !Ref TokenExchangeUserPool
+      ClientId: !Ref ServiceClientWithSecret
+      ParameterName: !Sub '/${AWS::StackName}/service-client-secret'
+    DependsOn:
+      - ServiceClientWithSecret
+      - ServiceClientSecretParameter
+
+  # Lambda Permissions for Cognito
+  DefineAuthChallengePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DefineAuthChallengeFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt TokenExchangeUserPool.Arn
+
+  CreateAuthChallengePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateAuthChallengeFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt TokenExchangeUserPool.Arn
+
+  VerifyAuthChallengePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref VerifyAuthChallengeFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt TokenExchangeUserPool.Arn
+
+  PreTokenGenerationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PreTokenGenerationFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt TokenExchangeUserPool.Arn
+
+  # Add Cognito permissions to Token Exchange Lambda Role
+  TokenExchangeCognitoPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CognitoAccessPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - cognito-idp:AdminInitiateAuth
+              - cognito-idp:AdminRespondToAuthChallenge
+            Resource: !GetAtt TokenExchangeUserPool.Arn
+      Roles:
+        - !Ref TokenExchangeLambdaRole
+
+  # API Gateway
+  TokenExchangeApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: OAuth2 Token Exchange API
+      Description: API for OAuth 2.0 token exchange using Cognito
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  TokenExchangeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TokenExchangeApi
+      ParentId: !GetAtt TokenExchangeApi.RootResourceId
+      PathPart: token-exchange
+
+  TokenExchangeAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      RestApiId: !Ref TokenExchangeApi
+      Name: TokenExchangeAuthorizer
+      Type: REQUEST
+      AuthorizerUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations'
+      AuthorizerResultTtlInSeconds: 300
+      IdentitySource: method.request.header.Authorization
+
+  TokenExchangeMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TokenExchangeApi
+      ResourceId: !Ref TokenExchangeResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref TokenExchangeAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TokenExchangeFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 400
+        - StatusCode: 401
+        - StatusCode: 500
+
+  # CORS Options Method
+  TokenExchangeOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TokenExchangeApi
+      ResourceId: !Ref TokenExchangeResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # API Gateway Deployment
+  TokenExchangeDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref TokenExchangeApi
+      StageName: v1
+      StageDescription:
+        ThrottlingRateLimit: 100
+        ThrottlingBurstLimit: 200
+        LoggingLevel: INFO
+        DataTraceEnabled: true
+        MetricsEnabled: true
+        AccessLogSetting:
+          DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+          Format: '$context.requestId $requestTime $httpMethod $resourcePath $status $responseLength'
+    DependsOn:
+      - TokenExchangeMethod
+      - TokenExchangeOptionsMethod
+
+  # Lambda Permissions for API Gateway
+  TokenExchangeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TokenExchangeFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TokenExchangeApi}/*/POST/token-exchange'
+
+  AuthorizerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TokenExchangeApi}/*'
+
+Outputs:
+  ExternalUserPoolId:
+    Description: 'External IDP User Pool ID for token generation'
+    Value: !Ref ExternalIdpUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-ExternalUserPoolId'
+
+  ExternalUserPoolClientId:
+    Description: 'External IDP User Pool Client ID for token generation'
+    Value: !Ref ExternalIdpUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-ExternalUserPoolClientId'
+
+  UserPoolId:
+    Description: 'Token Exchange User Pool ID (Client B) for token exchange'
+    Value: !Ref TokenExchangeUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolClientId:
+    Description: 'Service Client ID (with secret) for API Gateway authentication'
+    Value: !Ref ServiceClientWithSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolClientId'
+
+  ApiGatewayUrl:
+    Description: 'API Gateway URL for token exchange'
+    Value: !Sub 'https://${TokenExchangeApi}.execute-api.${AWS::Region}.amazonaws.com/v1/'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiGatewayUrl'
+
+  # Service Client Credentials for Testing
+  ServiceClientId:
+    Description: "Service Client ID for token exchange authentication"
+    Value: !Ref ServiceClientWithSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceClientId"
+
+  ServiceClientSecretInstructions:
+    Description: "Service client credentials are stored in SSM Parameter Store. Retrieve with: aws ssm get-parameter --name /${AWS::StackName}/service-client-secret --region ${AWS::Region} --query 'Parameter.Value' --output text | jq ."
+    Value: !Sub "aws ssm get-parameter --name /${AWS::StackName}/service-client-secret --region ${AWS::Region}"
+
+  TestingInstructions:
+    Description: "Run the end-to-end test script from the repo root"
+    Value: !Sub "./test-token-exchange.sh ${AWS::StackName} ${AWS::Region}"
+
+  # Existing outputs
+  TokenExchangeEndpoint:
+    Description: 'Token exchange endpoint URL'
+    Value: !Sub 'https://${TokenExchangeApi}.execute-api.${AWS::Region}.amazonaws.com/v1/token-exchange'
+    Export:
+      Name: !Sub '${AWS::StackName}-TokenExchangeEndpoint'
+
+  TestUserCredentials:
+    Description: 'Test user credentials for the external User Pool. The test script will set this password automatically.'
+    Value: 'Username: testuser@example.com, Password: TestPass123!'
+
+  SSMParameterName:
+    Description: 'SSM Parameter Store path containing service client credentials'
+    Value: !Sub '/${AWS::StackName}/service-client-secret'
+    Export:
+      Name: !Sub '${AWS::StackName}-SSMParameterName'
+
+  SSMParameterInfo:
+    Description: 'How to view the stored credentials'
+    Value: !Sub 'aws ssm get-parameter --name /${AWS::StackName}/service-client-secret --region ${AWS::Region}'

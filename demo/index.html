@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OAuth 2.0 Token Exchange Demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0e1a; color: #e0e0e0; min-height: 100vh; }
+  
+  .header { background: linear-gradient(135deg, #1a1f36, #252b48); padding: 24px 32px; border-bottom: 1px solid #2a3050; }
+  .header h1 { font-size: 20px; font-weight: 600; color: #fff; }
+  .header p { font-size: 13px; color: #8890a8; margin-top: 4px; }
+  
+  .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  
+  /* Config panel */
+  .config { background: #12162a; border: 1px solid #2a3050; border-radius: 8px; padding: 20px; margin-bottom: 24px; }
+  .config h2 { font-size: 14px; color: #8890a8; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 16px; }
+  .config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .config-field label { display: block; font-size: 12px; color: #6b7394; margin-bottom: 4px; }
+  .config-field input { width: 100%; padding: 8px 12px; background: #1a1f36; border: 1px solid #2a3050; border-radius: 4px; color: #e0e0e0; font-size: 13px; font-family: 'SF Mono', Monaco, monospace; }
+  .config-field input:focus { outline: none; border-color: #4a6cf7; }
+  .config-field.full { grid-column: 1 / -1; }
+  
+  /* Steps */
+  .steps { display: flex; flex-direction: column; gap: 20px; }
+  .step { background: #12162a; border: 1px solid #2a3050; border-radius: 8px; overflow: hidden; transition: border-color 0.3s; }
+  .step.active { border-color: #4a6cf7; }
+  .step.complete { border-color: #34d399; }
+  .step.error { border-color: #f87171; }
+  
+  .step-header { display: flex; align-items: center; padding: 16px 20px; cursor: pointer; user-select: none; }
+  .step-number { width: 32px; height: 32px; border-radius: 50%; background: #1a1f36; border: 2px solid #2a3050; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 600; margin-right: 16px; flex-shrink: 0; }
+  .step.complete .step-number { background: #34d399; border-color: #34d399; color: #0a0e1a; }
+  .step.active .step-number { border-color: #4a6cf7; color: #4a6cf7; }
+  .step.error .step-number { background: #f87171; border-color: #f87171; color: #0a0e1a; }
+  .step-title { font-size: 15px; font-weight: 600; }
+  .step-subtitle { font-size: 12px; color: #6b7394; margin-top: 2px; }
+  
+  .step-body { padding: 0 20px 20px; display: none; }
+  .step.active .step-body, .step.complete .step-body { display: block; }
+  
+  .step-explanation { background: #1a1f36; border-radius: 6px; padding: 14px 16px; margin-bottom: 16px; font-size: 13px; line-height: 1.6; color: #a0a8c4; border-left: 3px solid #4a6cf7; }
+  
+  .btn { padding: 10px 20px; border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+  .btn-primary { background: #4a6cf7; color: #fff; }
+  .btn-primary:hover { background: #5b7af8; }
+  .btn-primary:disabled { background: #2a3050; color: #6b7394; cursor: not-allowed; }
+  
+  /* Token display */
+  .token-panel { margin-top: 16px; }
+  .token-label { font-size: 12px; color: #6b7394; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+  .token-raw { background: #0a0e1a; border: 1px solid #2a3050; border-radius: 6px; padding: 12px; font-family: 'SF Mono', Monaco, monospace; font-size: 11px; word-break: break-all; max-height: 80px; overflow-y: auto; color: #8890a8; margin-bottom: 12px; }
+  .token-claims { background: #0a0e1a; border: 1px solid #2a3050; border-radius: 6px; padding: 12px; font-family: 'SF Mono', Monaco, monospace; font-size: 12px; line-height: 1.5; overflow-x: auto; }
+  .claim-key { color: #4a6cf7; }
+  .claim-value { color: #34d399; }
+  .claim-highlight { background: #4a6cf720; border-radius: 2px; padding: 1px 4px; }
+  
+  /* Comparison view */
+  .token-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+  .token-compare > div { min-width: 0; }
+  .compare-header { font-size: 13px; font-weight: 600; margin-bottom: 8px; padding: 8px 12px; border-radius: 4px; }
+  .compare-header.country { background: #f8717120; color: #f87171; }
+  .compare-header.global { background: #34d39920; color: #34d399; }
+  
+  /* Arrow between steps */
+  .step-arrow { text-align: center; color: #2a3050; font-size: 24px; }
+  
+  .status { padding: 8px 12px; border-radius: 4px; font-size: 12px; margin-top: 8px; }
+  .status.success { background: #34d39920; color: #34d399; }
+  .status.error { background: #f8717120; color: #f87171; }
+  .status.info { background: #4a6cf720; color: #4a6cf7; }
+
+  @media (max-width: 768px) {
+    .config-grid { grid-template-columns: 1fr; }
+    .token-compare { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🔄 OAuth 2.0 Token Exchange — Global Identity Demo</h1>
+  <p>Country IdP → Token Exchange → Global Identity Token (RFC 8693)</p>
+</div>
+
+<div class="container">
+  <!-- Configuration -->
+  <div class="config">
+    <h2>⚙️ Stack Configuration</h2>
+    <div class="config-grid">
+      <div class="config-field">
+        <label>Region</label>
+        <input type="text" id="cfg-region" value="eu-west-1">
+      </div>
+      <div class="config-field">
+        <label>Token Exchange Endpoint</label>
+        <input type="text" id="cfg-endpoint" value="https://xxxxxxxxxx.execute-api.eu-west-1.amazonaws.com/v1/token-exchange">
+      </div>
+      <div class="config-field">
+        <label>Country IdP Client ID (public, no secret)</label>
+        <input type="text" id="cfg-country-client-id" value="REPLACE_WITH_COUNTRY_CLIENT_ID">
+      </div>
+      <div class="config-field">
+        <label>Service Client ID</label>
+        <input type="text" id="cfg-service-client-id" value="REPLACE_WITH_SERVICE_CLIENT_ID">
+      </div>
+      <div class="config-field">
+        <label>Service Client Secret</label>
+        <input type="password" id="cfg-service-client-secret" value="REPLACE_WITH_YOUR_SERVICE_CLIENT_SECRET">
+      </div>
+      <div class="config-field">
+        <label>Country IdP Cognito Domain or Endpoint</label>
+        <input type="text" id="cfg-cognito-endpoint" value="https://cognito-idp.eu-west-1.amazonaws.com">
+      </div>
+      <div class="config-field">
+        <label>Country IdP User Pool ID</label>
+        <input type="text" id="cfg-user-pool-id" value="eu-west-1_xxxxxxxxx">
+      </div>
+      <div class="config-field">
+        <label>
+          <button class="btn btn-primary" onclick="loadFromClipboard()" style="font-size:11px;padding:6px 12px;">Auto-fill from test script output</button>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <!-- Steps -->
+  <div class="steps">
+
+    <!-- Step 1: Authenticate -->
+    <div class="step active" id="step1">
+      <div class="step-header" onclick="toggleStep(1)">
+        <div class="step-number">1</div>
+        <div>
+          <div class="step-title">Authenticate with Country IdP</div>
+          <div class="step-subtitle">User logs in via their local country identity provider</div>
+        </div>
+      </div>
+      <div class="step-body">
+        <div class="step-explanation">
+          This simulates a user logging into their local country app (e.g. Example Insurance).
+          The user authenticates with the Country IdP and receives an access token — this is
+          the local <strong>subject token</strong> that will be exchanged for a global identity token.
+          <br><br>
+          In production, this would be a browser-based OAuth flow and could include social login (Google, etc.).
+        </div>
+        <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
+          <div>
+            <label style="font-size:12px;color:#6b7394;display:block;margin-bottom:4px;">Username</label>
+            <input type="text" id="auth-username" value="testuser@example.com" style="padding:8px 12px;background:#1a1f36;border:1px solid #2a3050;border-radius:4px;color:#e0e0e0;font-size:13px;width:240px;">
+          </div>
+          <div>
+            <label style="font-size:12px;color:#6b7394;display:block;margin-bottom:4px;">Password</label>
+            <input type="password" id="auth-password" value="TestPass123!" style="padding:8px 12px;background:#1a1f36;border:1px solid #2a3050;border-radius:4px;color:#e0e0e0;font-size:13px;width:200px;">
+          </div>
+          <button class="btn btn-primary" id="btn-auth" onclick="doAuthenticate()">Authenticate</button>
+        </div>
+        <div id="step1-result"></div>
+      </div>
+    </div>
+
+    <div class="step-arrow">↓</div>
+
+    <!-- Step 2: Exchange -->
+    <div class="step" id="step2">
+      <div class="step-header" onclick="toggleStep(2)">
+        <div class="step-number">2</div>
+        <div>
+          <div class="step-title">Exchange for Global Identity Token</div>
+          <div class="step-subtitle">RFC 8693 token exchange — country token → global token</div>
+        </div>
+      </div>
+      <div class="step-body">
+        <div class="step-explanation">
+          The mobile app backend calls the token exchange endpoint with the country token
+          and its own service credentials. Behind the scenes:
+          <br><br>
+          1. Lambda Authorizer validates the app's service credentials<br>
+          2. TokenExchange Lambda verifies the country token cryptographically<br>
+          3. Cognito custom auth flow issues a global identity token<br>
+          4. PreTokenGeneration Lambda embeds the local user identity as custom claims<br>
+          <br>
+          This <strong>bypasses Cognito's 5-linked-identity limit</strong> — the linking is logical (via claims), not a native federation link.
+        </div>
+        <button class="btn btn-primary" id="btn-exchange" onclick="doExchange()" disabled>Exchange Token</button>
+        <div id="step2-result"></div>
+      </div>
+    </div>
+
+    <div class="step-arrow">↓</div>
+
+    <!-- Step 3: Compare -->
+    <div class="step" id="step3">
+      <div class="step-header" onclick="toggleStep(3)">
+        <div class="step-number">3</div>
+        <div>
+          <div class="step-title">Inspect & Compare Tokens</div>
+          <div class="step-subtitle">See the N:1 identity mapping — local user → global identity</div>
+        </div>
+      </div>
+      <div class="step-body">
+        <div class="step-explanation">
+          The global token carries the user's <strong>global identity</strong> as the subject,
+          with the <strong>country-specific identity preserved in custom claims</strong>.
+          Multiple country identities (Germany, Swiss, Direct) can all map to the same global identity.
+          <br><br>
+          Notice how the broad <code>aws.cognito.signin.user.admin</code> scope has been replaced
+          with specific global scopes — enforcing least privilege.
+        </div>
+        <div id="step3-result"></div>
+      </div>
+    </div>
+
+    <div class="step-arrow">↓</div>
+
+    <!-- Step 4: Extensibility -->
+    <div class="step" id="step4">
+      <div class="step-header" onclick="toggleStep(4)">
+        <div class="step-number">4</div>
+        <div>
+          <div class="step-title">Verification Extensibility</div>
+          <div class="step-subtitle">Non-standard IdPs and custom token formats</div>
+        </div>
+      </div>
+      <div class="step-body">
+        <div class="step-explanation">
+          Not all country IdPs produce standard JWTs. The <strong>VerifyAuthChallenge Lambda</strong>
+          is the extensibility point — you have full control over how the incoming token is verified.
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:12px;">
+          <div style="background:#1a1f36;border-radius:6px;padding:14px;border:1px solid #2a3050;">
+            <div style="font-size:12px;color:#4a6cf7;font-weight:600;margin-bottom:8px;">Option A: Verification API</div>
+            <pre style="font-size:11px;color:#a0a8c4;white-space:pre-wrap;font-family:'SF Mono',Monaco,monospace;">// Country exposes /verify
+const resp = await fetch(
+  COUNTRY_VERIFY_URL,
+  { headers: { token } }
+);
+answerCorrect = resp.ok;</pre>
+          </div>
+          <div style="background:#1a1f36;border-radius:6px;padding:14px;border:1px solid #2a3050;">
+            <div style="font-size:12px;color:#4a6cf7;font-weight:600;margin-bottom:8px;">Option B: Shared Key</div>
+            <pre style="font-size:11px;color:#a0a8c4;white-space:pre-wrap;font-family:'SF Mono',Monaco,monospace;">// Verify with HMAC/RSA key
+const key = await getKey();
+const decoded = jwt.verify(
+  token, key
+);
+answerCorrect = !!decoded;</pre>
+          </div>
+          <div style="background:#1a1f36;border-radius:6px;padding:14px;border:1px solid #2a3050;">
+            <div style="font-size:12px;color:#4a6cf7;font-weight:600;margin-bottom:8px;">Option C: Custom Format</div>
+            <pre style="font-size:11px;color:#a0a8c4;white-space:pre-wrap;font-family:'SF Mono',Monaco,monospace;">// Not even a JWT
+const parsed =
+  parseCustomToken(token);
+answerCorrect =
+  isValid(parsed);</pre>
+          </div>
+        </div>
+        <div class="status info" style="margin-top:12px;">
+          The output is <strong>always</strong> a standard Cognito JWT from the Global Identity Pool — regardless of what went in.
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+let countryToken = null;
+let globalToken = null;
+
+function decodeJwt(token) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    let payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (payload.length % 4) payload += '=';
+    return JSON.parse(atob(payload));
+  } catch (e) { return null; }
+}
+
+function formatClaims(claims, highlights) {
+  if (!claims) return '<span style="color:#f87171;">Could not decode token</span>';
+  let html = '{\n';
+  const keys = Object.keys(claims);
+  keys.forEach((key, i) => {
+    const val = JSON.stringify(claims[key]);
+    const isHighlight = highlights && highlights.includes(key);
+    const cls = isHighlight ? ' claim-highlight' : '';
+    html += `  <span class="claim-key${cls}">"${key}"</span>: <span class="claim-value${cls}">${val}</span>${i < keys.length - 1 ? ',' : ''}\n`;
+  });
+  html += '}';
+  return html;
+}
+
+function toggleStep(n) {
+  const el = document.getElementById('step' + n);
+  if (el.classList.contains('complete')) {
+    el.querySelector('.step-body').style.display = 
+      el.querySelector('.step-body').style.display === 'none' ? 'block' : 'none';
+  }
+}
+
+function setStepState(n, state) {
+  const el = document.getElementById('step' + n);
+  el.classList.remove('active', 'complete', 'error');
+  if (state) el.classList.add(state);
+}
+
+async function doAuthenticate() {
+  const btn = document.getElementById('btn-auth');
+  const result = document.getElementById('step1-result');
+  btn.disabled = true;
+  btn.textContent = 'Authenticating...';
+  setStepState(1, 'active');
+  result.innerHTML = '';
+
+  const region = document.getElementById('cfg-region').value;
+  const clientId = document.getElementById('cfg-country-client-id').value;
+  const username = document.getElementById('auth-username').value;
+  const password = document.getElementById('auth-password').value;
+  const endpoint = `https://cognito-idp.${region}.amazonaws.com/`;
+
+  try {
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-amz-json-1.1',
+        'X-Amz-Target': 'AWSCognitoIdentityProviderService.InitiateAuth'
+      },
+      body: JSON.stringify({
+        AuthFlow: 'USER_PASSWORD_AUTH',
+        ClientId: clientId,
+        AuthParameters: { USERNAME: username, PASSWORD: password }
+      })
+    });
+
+    const data = await resp.json();
+    if (data.AuthenticationResult && data.AuthenticationResult.AccessToken) {
+      countryToken = data.AuthenticationResult.AccessToken;
+      const claims = decodeJwt(countryToken);
+      
+      result.innerHTML = `
+        <div class="token-panel">
+          <div class="token-label">Country IdP Access Token</div>
+          <div class="token-raw">${countryToken}</div>
+          <div class="token-label">Decoded Claims</div>
+          <div class="token-claims"><pre>${formatClaims(claims)}</pre></div>
+        </div>
+        <div class="status success" style="margin-top:12px;">✅ Authenticated — token scoped to Country IdP only</div>
+      `;
+      setStepState(1, 'complete');
+      setStepState(2, 'active');
+      document.getElementById('btn-exchange').disabled = false;
+    } else {
+      throw new Error(data.message || data.__type || 'Authentication failed');
+    }
+  } catch (e) {
+    result.innerHTML = `<div class="status error">❌ ${e.message}</div>`;
+    setStepState(1, 'error');
+  }
+  btn.disabled = false;
+  btn.textContent = 'Authenticate';
+}
+
+async function doExchange() {
+  const btn = document.getElementById('btn-exchange');
+  const result = document.getElementById('step2-result');
+  btn.disabled = true;
+  btn.textContent = 'Exchanging...';
+  setStepState(2, 'active');
+  result.innerHTML = '';
+
+  const endpoint = document.getElementById('cfg-endpoint').value;
+  const serviceId = document.getElementById('cfg-service-client-id').value;
+  const serviceSecret = document.getElementById('cfg-service-client-secret').value;
+  const authHeader = btoa(serviceId + ':' + serviceSecret);
+
+  try {
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': 'Basic ' + authHeader
+      },
+      body: 'grant_type=urn:ietf:params:oauth:grant-type:token-exchange&subject_token=' +
+            encodeURIComponent(countryToken) +
+            '&subject_token_type=urn:ietf:params:oauth:token-type:access_token'
+    });
+
+    const data = await resp.json();
+    if (data.access_token) {
+      globalToken = data.access_token;
+      
+      result.innerHTML = `
+        <div class="status success" style="margin-top:12px;">
+          ✅ Token exchange successful — HTTP ${resp.status}<br>
+          <span style="color:#8890a8;">token_type: ${data.token_type} | expires_in: ${data.expires_in}s | issued_token_type: ${data.issued_token_type}</span>
+        </div>
+      `;
+      setStepState(2, 'complete');
+      setStepState(3, 'active');
+      showComparison();
+    } else {
+      throw new Error(data.error_description || data.error || 'Exchange failed');
+    }
+  } catch (e) {
+    result.innerHTML = `<div class="status error">❌ ${e.message}</div>`;
+    setStepState(2, 'error');
+  }
+  btn.disabled = false;
+  btn.textContent = 'Exchange Token';
+}
+
+function showComparison() {
+  const result = document.getElementById('step3-result');
+  const countryClaims = decodeJwt(countryToken);
+  const globalClaims = decodeJwt(globalToken);
+
+  const globalHighlights = [
+    'custom:original_sub', 'custom:original_username', 'custom:original_iss',
+    'custom:original_client_id', 'custom:original_scope', 'custom:token_exchange',
+    'custom:service_identity', 'custom:service_scopes', 'scope'
+  ];
+
+  result.innerHTML = `
+    <div class="token-compare">
+      <div>
+        <div class="compare-header country">🏠 Country IdP Token (before)</div>
+        <div class="token-raw">${countryToken.substring(0, 80)}...</div>
+        <div class="token-claims"><pre>${formatClaims(countryClaims)}</pre></div>
+      </div>
+      <div>
+        <div class="compare-header global">🌍 Global Identity Token (after)</div>
+        <div class="token-raw">${globalToken.substring(0, 80)}...</div>
+        <div class="token-claims"><pre>${formatClaims(globalClaims, globalHighlights)}</pre></div>
+      </div>
+    </div>
+    <div style="margin-top:16px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+      <div class="status info">
+        🌍 <strong>N:1 Mapping</strong><br>
+        local sub ${countryClaims?.sub?.substring(0,8)}... → global ${globalClaims?.sub?.substring(0,8)}...
+      </div>
+      <div class="status info">
+        🔐 <strong>Least Privilege</strong><br>
+        ${countryClaims?.scope || 'N/A'} → ${globalClaims?.scope?.split(' ').length || 0} specific scopes
+      </div>
+      <div class="status info">
+        🔗 <strong>No Link Limit</strong><br>
+        Logical linking via claims, not Cognito federation
+      </div>
+    </div>
+  `;
+  setStepState(4, 'active');
+}
+
+function loadFromClipboard() {
+  const endpoint = prompt('Paste your TokenExchangeEndpoint:');
+  if (endpoint) document.getElementById('cfg-endpoint').value = endpoint;
+}
+</script>
+</body>
+</html>

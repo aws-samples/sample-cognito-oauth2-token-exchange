@@ -1,0 +1,30 @@
+{
+  "name": "sample-cognito-oauth2-token-exchange",
+  "version": "1.0.0",
+  "description": "OAuth 2.0 Token Exchange implementation using Amazon Cognito with delegation pattern",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"No tests specified\" && exit 0"
+  },
+  "keywords": [
+    "aws",
+    "cognito",
+    "oauth2",
+    "token-exchange",
+    "delegation",
+    "rfc8693",
+    "authentication",
+    "authorization"
+  ],
+  "author": "AWS Samples",
+  "license": "MIT-0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aws-samples/sample-cognito-oauth2-token-exchange"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudformation": "^3.848.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.848.0"
+  },
+  "devDependencies": {}
+}
