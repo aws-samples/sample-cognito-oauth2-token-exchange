@@ -37,7 +37,7 @@ cat > lambda-layer-build/nodejs/package.json << 'EOF'
   "name": "jwt-verify-layer",
   "version": "1.0.0",
   "dependencies": {
-    "aws-jwt-verify": "^4.0.1"
+    "aws-jwt-verify": "^5.2.1"
   }
 }
 EOF
