@@ -280,6 +280,13 @@ Resources:
                 Action:
                   - ssm:GetParameter
                 Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/service-client-secret'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'ssm.${AWS::Region}.amazonaws.com'
 
   # Pre-Token Generation Lambda Role
   PreTokenGenerationRole:
@@ -425,28 +432,17 @@ Resources:
           });
           
           exports.handler = async (event, context) => {
-            console.log('Verify Auth Challenge event:', JSON.stringify(event, null, 2));
-            
+            // Do NOT log the raw event or challengeAnswer: it is a live bearer token.
             try {
-              // Get the user token from the challenge answer
               const userToken = event.request.challengeAnswer;
-              console.log('Attempting to verify user token...');
-              
-              // Verify the user token using aws-jwt-verify
               const payload = await verifier.verify(userToken);
-              console.log('User token verified successfully:', JSON.stringify(payload, null, 2));
-              
-              // Set challenge result to success
+              // Log only a non-sensitive identifier, never the token or full claims.
+              console.log('Subject token verified for sub:', payload.sub);
               event.response.answerCorrect = true;
-              console.log('Set answerCorrect = true');
-              
             } catch (error) {
-              console.error('Token verification failed:', error);
+              console.error('Subject token verification failed (denying challenge):', error.message);
               event.response.answerCorrect = false;
-              console.log('Set answerCorrect = false due to verification failure');
             }
-            
-            console.log('Returning event with answerCorrect =', event.response.answerCorrect);
             return event;
           };
       Environment:
@@ -497,75 +493,70 @@ Resources:
             clientId: process.env.EXTERNAL_CLIENT_ID,
           });
 
+          // The delegated token carries the SERVICE's scopes (exercised on the
+          // user's behalf); this fixed set is the ceiling the service may grant.
+          const SERVICE_SCOPE_CEILING = [
+            'read:user-profile',
+            'read:user-permissions',
+            'write:audit-logs',
+            'access:downstream-apis'
+          ];
+
           exports.handler = async (event, context) => {
-            console.log('Pre-token generation V2_0 event:', JSON.stringify(event, null, 2));
-            
-            // Skip claim enrichment if delegation claims are disabled
+            // Do NOT log the raw event: clientMetadata carries a live bearer token.
             if (process.env.ENABLE_DELEGATION_CLAIMS === 'false') {
-              console.log('Delegation claims disabled - passing through without modification');
               return event;
             }
-            
             try {
-              // Check if this is a token exchange request via ClientMetadata
-              if (event.request.clientMetadata && 
-                  event.request.clientMetadata.TokenExchange === 'true' && 
-                  event.request.clientMetadata.OriginalUserToken) {
-                
-                console.log('Token exchange detected - extracting claims from original user token');
-                
+              const md = event.request.clientMetadata;
+              if (md && md.TokenExchange === 'true' && md.OriginalUserToken) {
                 // SECURITY: clientMetadata is caller-supplied and is NOT validated by
-                // Cognito. Cryptographically verify the token (signature, expiry,
-                // audience) before trusting any claim. On failure verify() throws,
-                // which aborts token issuance (fail closed) - see catch block below.
-                const originalToken = event.request.clientMetadata.OriginalUserToken;
-                const payload = await verifier.verify(originalToken);
+                // Cognito. Verify the token before trusting any claim; verify() throws
+                // on failure, aborting token issuance (fail closed) via the catch.
+                const payload = await verifier.verify(md.OriginalUserToken);
                 console.log('Verified original user token for sub:', payload.sub);
-                
-                // Define service-specific scopes for the service client identity
-                const serviceScopes = [
-                  'read:user-profile',
-                  'read:user-permissions', 
-                  'write:audit-logs',
-                  'access:downstream-apis'
-                ];
-                
-                // V2_0 allows modification of access tokens via claimsAndScopeOverrideDetails
+
+                // SECURITY (E1): bound granted scopes to the service ceiling. A caller
+                // MAY request a subset via clientMetadata.RequestedScope (RFC 8693
+                // 'scope'); anything beyond the ceiling is rejected so the exchange
+                // can never escalate past the service's own grant.
+                const requested = (md.RequestedScope || '')
+                  .split(' ').map(function (s) { return s.trim(); }).filter(Boolean);
+                let grantedScopes;
+                if (requested.length > 0) {
+                  const disallowed = requested.filter(function (s) { return SERVICE_SCOPE_CEILING.indexOf(s) === -1; });
+                  if (disallowed.length > 0) {
+                    throw new Error('Requested scopes exceed the service grant: ' + disallowed.join(' '));
+                  }
+                  grantedScopes = requested;
+                } else {
+                  grantedScopes = SERVICE_SCOPE_CEILING;
+                }
+
                 event.response.claimsAndScopeOverrideDetails = {
                   accessTokenGeneration: {
                     claimsToAddOrOverride: {
-                      // Original user identity claims (prefixed to avoid conflicts)
                       'custom:original_sub': payload.sub,
                       'custom:original_username': payload.username || payload.sub,
                       'custom:original_client_id': payload.client_id,
                       'custom:original_iss': payload.iss,
                       'custom:original_scope': payload.scope,
                       'custom:original_auth_time': payload.auth_time?.toString(),
-                      
-                      // Service-specific claims
                       'custom:token_exchange': 'true',
-                      'custom:service_identity': event.userName, // Use the actual service identity user
-                      'custom:service_scopes': serviceScopes.join(' ')
+                      'custom:service_identity': event.userName,
+                      'custom:service_scopes': grantedScopes.join(' ')
                     },
-                    scopesToAdd: serviceScopes,
-                    scopesToSuppress: ['aws.cognito.signin.user.admin'] // Remove default scope
+                    scopesToAdd: grantedScopes,
+                    scopesToSuppress: ['aws.cognito.signin.user.admin']
                   }
                 };
-                
-                console.log('Claims and scope override details:', JSON.stringify(event.response.claimsAndScopeOverrideDetails, null, 2));
-              } else {
-                console.log('Not a token exchange request - no modifications applied');
+                console.log('Delegation applied. Granted scopes:', grantedScopes.join(' '));
               }
-              
             } catch (error) {
-              // Fail closed: if verification or claim enrichment fails, do NOT issue a
-              // token. Re-throwing aborts token generation so no unverified/partial
-              // token is ever returned.
-              console.error('Pre-token generation error (failing closed):', error);
+              // Fail closed: on verification/enrichment failure, do NOT issue a token.
+              console.error('Pre-token generation error (failing closed):', error.message);
               throw error;
             }
-            
-            console.log('Pre-token generation V2_0 completed');
             return event;
           };
 
@@ -612,7 +603,8 @@ Resources:
             try {
               console.log('Fetching credentials from SSM Parameter Store');
               const command = new GetParameterCommand({
-                Name: process.env.CLIENT_SECRET_PARAMETER
+                Name: process.env.CLIENT_SECRET_PARAMETER,
+                WithDecryption: true
               });
               const response = await ssmClient.send(command);
               
@@ -628,8 +620,17 @@ Resources:
           }
           
           exports.handler = async (event, context) => {
-            console.log('Authorizer event:', JSON.stringify(event, null, 2));
-            
+            // Do NOT log the raw event: it contains the Basic Authorization header.
+            const crypto = require('crypto');
+
+            // Constant-time comparison to avoid credential timing oracles (#5).
+            const safeEqual = (a, b) => {
+              const ab = Buffer.from(String(a));
+              const bb = Buffer.from(String(b));
+              if (ab.length !== bb.length) return false;
+              return crypto.timingSafeEqual(ab, bb);
+            };
+
             // Helper to get header case-insensitively
             const getHeader = (name) => {
               const lower = name.toLowerCase();
@@ -655,7 +656,6 @@ Resources:
               const authHeaderValue = getHeader('Authorization');
               if (!authHeaderValue || !authHeaderValue.startsWith("Basic ")) {
                 console.log('Authorization header check failed');
-                console.log('Authorization header:', authHeaderValue);
                 return generatePolicy('user', 'Deny', event.methodArn);
               }
               
@@ -664,20 +664,17 @@ Resources:
               const credentials = Buffer.from(authHeader, 'base64').toString('utf-8');
               const [clientId, clientSecret] = credentials.split(':');
               
-              console.log('Extracted clientId:', clientId);
-              
               // Get the real client credentials from SSM Parameter Store
               const realCredentials = await getClientCredentials();
-              console.log('Expected clientId from SSM:', realCredentials.clientId);
               
-              // Validate service client credentials
-              if (clientId === realCredentials.clientId && clientSecret === realCredentials.clientSecret) {
-                console.log('Authorization successful - delegation enabled');
+              // Constant-time compare of BOTH id and secret; evaluate both before AND.
+              const idOk = safeEqual(clientId, realCredentials.clientId);
+              const secretOk = safeEqual(clientSecret, realCredentials.clientSecret);
+              if (idOk && secretOk) {
                 return generatePolicy(clientId, 'Allow', event.methodArn);
-              } else {
-                console.log('Credential validation failed');
-                return generatePolicy('user', 'Deny', event.methodArn);
               }
+              console.log('Credential validation failed');
+              return generatePolicy('user', 'Deny', event.methodArn);
               
             } catch (error) {
               console.error('Authorizer error:', error);
@@ -753,8 +750,7 @@ Resources:
           }
           
           exports.handler = async (event) => {
-            console.log('Token exchange event:', JSON.stringify(event, null, 2));
-            // Updated: 2025-07-21 - Removed SECRET_HASH requirement for admin operations
+            // Do NOT log the raw event: the form body carries a live subject_token.
             
             try {
               const body = parseFormBody(event.body);
@@ -836,7 +832,10 @@ Resources:
                 },
                 ClientMetadata: {
                   OriginalUserToken: body.subject_token,
-                  TokenExchange: 'true'
+                  TokenExchange: 'true',
+                  // RFC 8693 optional requested scope. PreTokenGeneration bounds this
+                  // to the service scope ceiling and rejects anything beyond it (#6).
+                  RequestedScope: body.scope || ''
                 }
               });
               
@@ -1099,15 +1098,10 @@ Resources:
       ServiceToken: !GetAtt CreateServiceIdentitiesFunction.Arn
       UserPoolId: !Ref TokenExchangeUserPool
 
-  # SSM Parameter Store for Service Client Secret
-  ServiceClientSecretParameter:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub '/${AWS::StackName}/service-client-secret'
-      Description: 'Service Client credentials for token exchange (stored by Custom Resource)'
-      Type: String
-      Tier: Standard
-      Value: '{"clientId":"placeholder","clientSecret":"placeholder"}'
+  # NOTE: the service-client secret is stored in SSM as a SecureString. CloudFormation
+  # cannot CREATE a SecureString parameter (it can only reference existing ones), so the
+  # StoreClientSecret custom resource creates/updates it as SecureString at deploy time
+  # and deletes it on stack deletion.
 
   # Custom Resource Lambda Role - Fetches secret from Cognito and stores in SSM
   StoreClientSecretRole:
@@ -1134,7 +1128,17 @@ Resources:
               - Effect: Allow
                 Action:
                   - ssm:PutParameter
+                  - ssm:DeleteParameter
                 Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/service-client-secret'
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'ssm.${AWS::Region}.amazonaws.com'
 
   # Custom Resource Lambda - Fetches Cognito secret and stores in SSM
   StoreClientSecretFunction:
@@ -1161,16 +1165,22 @@ Resources:
       Code:
         ZipFile: |
           const { CognitoIdentityProviderClient, DescribeUserPoolClientCommand } = require('@aws-sdk/client-cognito-identity-provider');
-          const { SSMClient, PutParameterCommand } = require('@aws-sdk/client-ssm');
+          const { SSMClient, PutParameterCommand, DeleteParameterCommand } = require('@aws-sdk/client-ssm');
           const https = require('https');
           const url = require('url');
           
           exports.handler = async (event, context) => {
-            console.log('Custom Resource event:', JSON.stringify(event, null, 2));
+            console.log('Custom Resource event type:', event.RequestType);
             
-            // Handle Delete - just return success
+            // Delete the SecureString parameter when the stack is deleted.
             if (event.RequestType === 'Delete') {
-              console.log('Delete request - returning success');
+              try {
+                const delSsm = new SSMClient({ region: process.env.AWS_REGION });
+                await delSsm.send(new DeleteParameterCommand({ Name: event.ResourceProperties.ParameterName }));
+                console.log('Deleted SecureString parameter on stack delete');
+              } catch (e) {
+                console.log('Parameter delete skipped:', e.name);
+              }
               await sendResponse(event, context, 'SUCCESS', 'Delete completed');
               return;
             }
@@ -1206,7 +1216,7 @@ Resources:
               const putCommand = new PutParameterCommand({
                 Name: event.ResourceProperties.ParameterName,
                 Value: secretValue,
-                Type: 'String',
+                Type: 'SecureString',
                 Overwrite: true,
                 Description: 'Service client credentials for OAuth 2.0 token exchange'
               });
@@ -1270,8 +1280,6 @@ Resources:
       UserPoolId: !Ref TokenExchangeUserPool
       ClientId: !Ref ServiceClientWithSecret
       ParameterName: !Sub '/${AWS::StackName}/service-client-secret'
-    DependsOn:
-      - ServiceClientSecretParameter
 
   # Lambda Permissions for Cognito
   DefineAuthChallengePermission:
@@ -1406,7 +1414,7 @@ Resources:
         ThrottlingRateLimit: 100
         ThrottlingBurstLimit: 200
         LoggingLevel: INFO
-        DataTraceEnabled: true
+        DataTraceEnabled: false
         MetricsEnabled: true
         AccessLogSetting:
           DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
@@ -1472,7 +1480,7 @@ Outputs:
 
   ServiceClientSecretInstructions:
     Description: "Service client credentials are stored in SSM Parameter Store under /<stack-name>/service-client-secret. Run the command in this output's Value to retrieve them."
-    Value: !Sub "aws ssm get-parameter --name /${AWS::StackName}/service-client-secret --region ${AWS::Region}"
+    Value: !Sub "aws ssm get-parameter --name /${AWS::StackName}/service-client-secret --with-decryption --region ${AWS::Region}"
 
   TestingInstructions:
     Description: "Run the end-to-end test script from the repo root"
@@ -1497,4 +1505,4 @@ Outputs:
 
   SSMParameterInfo:
     Description: 'How to view the stored credentials'
-    Value: !Sub 'aws ssm get-parameter --name /${AWS::StackName}/service-client-secret --region ${AWS::Region}'
+    Value: !Sub 'aws ssm get-parameter --name /${AWS::StackName}/service-client-secret --with-decryption --region ${AWS::Region}'

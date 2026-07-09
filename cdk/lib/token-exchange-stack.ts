@@ -6,7 +6,6 @@ import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
-import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as cr from 'aws-cdk-lib/custom-resources';
 import { NagSuppressions } from 'cdk-nag';
 
@@ -43,10 +42,11 @@ export class TokenExchangeStack extends cdk.Stack {
       },
       {
         id: 'AwsSolutions-IAM5',
-        reason: 'CDK Provider framework requires lambda:InvokeFunction permission with :* suffix to support Lambda versioning/aliases. This is standard CDK behavior for custom resources.',
+        reason: 'lambda:InvokeFunction with :* is required by the CDK Provider framework for Lambda versioning/aliases (standard custom-resource behavior). Resource::* applies only to the kms:Decrypt/Encrypt/GenerateDataKey statements on the authorizer and store-secret roles: the SecureString is encrypted with the account AWS-managed key (alias/aws/ssm) whose ARN is not known at synth, and each statement is constrained to SSM via the kms:ViaService condition.',
         appliesTo: [
           'Resource::<CreateServiceIdentities571DBA9A.Arn>:*',
           'Resource::<StoreClientSecret52339365.Arn>:*',
+          'Resource::*',
         ],
       },
       {
@@ -267,77 +267,48 @@ export class TokenExchangeStack extends cdk.Stack {
       handler: 'index.handler',
       code: lambda.Code.fromInline(`
         const { CognitoJwtVerifier } = require('aws-jwt-verify');
-        const { JwtRsaVerifier } = require('aws-jwt-verify');
-        
-        // Verifier for Cognito access tokens (original behavior)
+
+        // Verifier for Cognito ACCESS tokens (MCP 3LO path).
         const accessVerifier = CognitoJwtVerifier.create({
           userPoolId: process.env.EXTERNAL_USER_POOL_ID,
           tokenUse: "access",
           clientId: process.env.EXTERNAL_CLIENT_ID,
         });
-        
-        // Verifier for Cognito ID tokens (for AgentCore Identity OBO flow)
+
+        // Verifier for Cognito ID tokens (AgentCore Identity OBO path).
         const idVerifier = CognitoJwtVerifier.create({
           userPoolId: process.env.EXTERNAL_USER_POOL_ID,
           tokenUse: "id",
           clientId: process.env.EXTERNAL_CLIENT_ID,
         });
-        
-        // Generic JWKS verifier for JWTs from the same issuer (fallback)
-        const issuer = \`https://cognito-idp.\${process.env.AWS_REGION}.amazonaws.com/\${process.env.EXTERNAL_USER_POOL_ID}\`;
-        const genericVerifier = JwtRsaVerifier.create({
-          issuer: issuer,
-          jwksUri: \`\${issuer}/.well-known/jwks.json\`,
-        });
-        
+
+        // NOTE: verification is pinned to this user pool + client + tokenUse.
+        // There is deliberately NO issuer-only "generic" fallback: accepting any
+        // JWT from the issuer without pinning audience/client/tokenUse would open a
+        // confused-deputy / token-passthrough gap (security review S1/#3).
+
         exports.handler = async (event, context) => {
-          console.log('Verify Auth Challenge event:', JSON.stringify(event, null, 2));
-          
+          // Do NOT log the raw event or challengeAnswer: it is a live bearer token.
           try {
             const userToken = event.request.challengeAnswer;
-            console.log('Attempting to verify user token...');
-            
+
             let payload;
-            
-            // Try access token first (original behavior)
             try {
               payload = await accessVerifier.verify(userToken);
-              console.log('Verified as Cognito access token');
             } catch (accessErr) {
-              console.log('Not a valid access token, trying ID token...');
-              
-              // Try ID token (needed for AgentCore Identity OBO which sends ID tokens)
-              try {
-                payload = await idVerifier.verify(userToken);
-                console.log('Verified as Cognito ID token');
-              } catch (idErr) {
-                console.log('Not a valid ID token, trying generic JWT...');
-                
-                // Try generic JWT verification (just check signature + issuer)
-                try {
-                  payload = await genericVerifier.verify(userToken);
-                  console.log('Verified as generic JWT from trusted issuer');
-                } catch (genericErr) {
-                  console.error('All verification methods failed');
-                  console.error('Access token error:', accessErr.message);
-                  console.error('ID token error:', idErr.message);
-                  console.error('Generic JWT error:', genericErr.message);
-                  throw new Error('Token verification failed: ' + genericErr.message);
-                }
-              }
+              // Fall back to ID token (both are pinned to client + tokenUse).
+              payload = await idVerifier.verify(userToken);
             }
-            
-            console.log('Token verified successfully. Claims:', JSON.stringify(payload, null, 2));
+
+            // Log only a non-sensitive identifier, never the token or full claims.
+            console.log('Subject token verified for sub:', payload.sub);
             event.response.answerCorrect = true;
-            console.log('Set answerCorrect = true');
-            
+
           } catch (error) {
-            console.error('Token verification failed:', error);
+            console.error('Subject token verification failed (denying challenge):', error.message);
             event.response.answerCorrect = false;
-            console.log('Set answerCorrect = false due to verification failure');
           }
-          
-          console.log('Returning event with answerCorrect =', event.response.answerCorrect);
+
           return event;
         };
       `),
@@ -359,45 +330,68 @@ export class TokenExchangeStack extends cdk.Stack {
       code: lambda.Code.fromInline(`
         const { CognitoJwtVerifier } = require('aws-jwt-verify');
 
-        // Verifier for the EXTERNAL IdP that issued the user's (subject) token.
-        // aws-jwt-verify caches the IdP JWKS after the first fetch.
-        const verifier = CognitoJwtVerifier.create({
+        // The subject (user) token may be an ACCESS token (MCP 3LO) or an ID token
+        // (AgentCore OBO). Verify against BOTH, each pinned to the external pool +
+        // client + tokenUse. No issuer-only fallback (security review #3).
+        const accessVerifier = CognitoJwtVerifier.create({
           userPoolId: process.env.EXTERNAL_USER_POOL_ID,
           tokenUse: "access",
           clientId: process.env.EXTERNAL_CLIENT_ID,
         });
+        const idVerifier = CognitoJwtVerifier.create({
+          userPoolId: process.env.EXTERNAL_USER_POOL_ID,
+          tokenUse: "id",
+          clientId: process.env.EXTERNAL_CLIENT_ID,
+        });
+
+        // The delegated token carries the SERVICE's scopes (exercised on the user's
+        // behalf); this fixed set is the ceiling the service is permitted to grant.
+        const SERVICE_SCOPE_CEILING = [
+          'read:user-profile',
+          'read:user-permissions',
+          'write:audit-logs',
+          'access:downstream-apis'
+        ];
 
         exports.handler = async (event, context) => {
-          console.log('Pre-token generation V2_0 event:', JSON.stringify(event, null, 2));
-          
-          // Skip claim enrichment if delegation claims are disabled
+          // Do NOT log the raw event: clientMetadata carries a live bearer token.
           if (process.env.ENABLE_DELEGATION_CLAIMS === 'false') {
-            console.log('Delegation claims disabled - passing through without modification');
             return event;
           }
-          
+
           try {
-            if (event.request.clientMetadata && 
-                event.request.clientMetadata.TokenExchange === 'true' && 
-                event.request.clientMetadata.OriginalUserToken) {
-              
-              console.log('Token exchange detected - extracting claims from original user token');
-              
+            const md = event.request.clientMetadata;
+            if (md && md.TokenExchange === 'true' && md.OriginalUserToken) {
+
               // SECURITY: clientMetadata is caller-supplied and is NOT validated by
               // Cognito. Cryptographically verify the token (signature, expiry,
-              // audience) before trusting any claim. On failure verify() throws,
-              // which aborts token issuance (fail closed) - see catch block below.
-              const originalToken = event.request.clientMetadata.OriginalUserToken;
-              const payload = await verifier.verify(originalToken);
+              // audience) before trusting any claim. verify() throws on failure,
+              // aborting token issuance (fail closed) via the catch block.
+              let payload;
+              try {
+                payload = await accessVerifier.verify(md.OriginalUserToken);
+              } catch (accessErr) {
+                payload = await idVerifier.verify(md.OriginalUserToken);
+              }
               console.log('Verified original user token for sub:', payload.sub);
-              
-              const serviceScopes = [
-                'read:user-profile',
-                'read:user-permissions', 
-                'write:audit-logs',
-                'access:downstream-apis'
-              ];
-              
+
+              // SECURITY (E1): bound the granted scopes to the service ceiling. A
+              // caller MAY request a subset via clientMetadata.RequestedScope
+              // (RFC 8693 'scope'); anything outside the ceiling is rejected so the
+              // exchange can never escalate beyond the service's own grant.
+              const requested = (md.RequestedScope || '')
+                .split(' ').map(s => s.trim()).filter(Boolean);
+              let grantedScopes;
+              if (requested.length > 0) {
+                const disallowed = requested.filter(s => !SERVICE_SCOPE_CEILING.includes(s));
+                if (disallowed.length > 0) {
+                  throw new Error('Requested scopes exceed the service grant: ' + disallowed.join(' '));
+                }
+                grantedScopes = requested;
+              } else {
+                grantedScopes = SERVICE_SCOPE_CEILING;
+              }
+
               event.response.claimsAndScopeOverrideDetails = {
                 accessTokenGeneration: {
                   claimsToAddOrOverride: {
@@ -408,27 +402,24 @@ export class TokenExchangeStack extends cdk.Stack {
                     'custom:original_scope': payload.scope,
                     'custom:original_auth_time': payload.auth_time?.toString(),
                     'custom:token_exchange': 'true',
-                    'custom:service_identity': event.userName, // Use the actual service identity user
-                    'custom:service_scopes': serviceScopes.join(' ')
+                    'custom:service_identity': event.userName,
+                    'custom:service_scopes': grantedScopes.join(' ')
                   },
-                  scopesToAdd: serviceScopes,
+                  scopesToAdd: grantedScopes,
                   scopesToSuppress: ['aws.cognito.signin.user.admin']
                 }
               };
-              
-              console.log('Claims and scope override details:', JSON.stringify(event.response.claimsAndScopeOverrideDetails, null, 2));
-            } else {
-              console.log('Not a token exchange request - no modifications applied');
+
+              // Log the granted scopes only (non-sensitive), never the token/claims.
+              console.log('Delegation applied. Granted scopes:', grantedScopes.join(' '));
             }
-            
+
           } catch (error) {
-            // Fail closed: if verification or claim enrichment fails, do NOT issue a
-            // token. Re-throwing aborts token generation.
-            console.error('Pre-token generation error (failing closed):', error);
+            // Fail closed: on verification/enrichment failure, do NOT issue a token.
+            console.error('Pre-token generation error (failing closed):', error.message);
             throw error;
           }
-          
-          console.log('Pre-token generation V2_0 completed');
+
           return event;
         };
       `),
@@ -643,15 +634,13 @@ export class TokenExchangeStack extends cdk.Stack {
     // ========================================
     // SSM Parameter Store for Client Secret
     // ========================================
-    const clientSecretParameter = new ssm.StringParameter(this, 'ServiceClientSecretParameter', {
-      parameterName: `/${this.stackName}/service-client-secret`,
-      description: 'Service Client credentials for token exchange',
-      stringValue: JSON.stringify({
-        clientId: 'placeholder',
-        clientSecret: 'placeholder',
-      }),
-      tier: ssm.ParameterTier.STANDARD,
-    });
+    // The service-client secret is sensitive, so it must live in SSM as a
+    // SecureString. CloudFormation/CDK cannot create a SecureString with a
+    // plaintext value, and SSM rejects changing a String parameter's type on
+    // overwrite — so the StoreClientSecret custom resource CREATES it as a
+    // SecureString at deploy time. We reference it here by name/ARN.
+    const clientSecretParameterName = `/${this.stackName}/service-client-secret`;
+    const clientSecretParameterArn = `arn:${this.partition}:ssm:${this.region}:${this.account}:parameter${clientSecretParameterName}`;
 
     // Custom Resource to fetch and store client secret
     const storeClientSecretFunction = new lambda.Function(this, 'StoreClientSecret', {
@@ -664,10 +653,17 @@ export class TokenExchangeStack extends cdk.Stack {
         const { SSMClient, PutParameterCommand } = require('@aws-sdk/client-ssm');
         
         exports.handler = async (event, context) => {
-          console.log('Custom Resource event:', JSON.stringify(event, null, 2));
+          console.log('Custom Resource event type:', event.RequestType);
           
           if (event.RequestType === 'Delete') {
-            console.log('Delete request - returning success');
+            try {
+              const { DeleteParameterCommand } = require('@aws-sdk/client-ssm');
+              const delSsm = new SSMClient({ region: process.env.AWS_REGION });
+              await delSsm.send(new DeleteParameterCommand({ Name: event.ResourceProperties.ParameterName }));
+              console.log('Deleted SecureString parameter on stack delete');
+            } catch (e) {
+              console.log('Parameter delete skipped:', e.name);
+            }
             await sendResponse(event, context, 'SUCCESS', 'Delete completed');
             return;
           }
@@ -698,7 +694,7 @@ export class TokenExchangeStack extends cdk.Stack {
             const putCommand = new PutParameterCommand({
               Name: event.ResourceProperties.ParameterName,
               Value: secretValue,
-              Type: 'String',
+              Type: 'SecureString',
               Overwrite: true,
               Description: 'Service client credentials for OAuth 2.0 token exchange'
             });
@@ -759,7 +755,24 @@ export class TokenExchangeStack extends cdk.Stack {
       })
     );
 
-    clientSecretParameter.grantWrite(storeClientSecretFunction);
+    // Custom resource: create/update + clean up the SecureString parameter (scoped to the exact ARN).
+    storeClientSecretFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['ssm:PutParameter', 'ssm:DeleteParameter'],
+        resources: [clientSecretParameterArn],
+      })
+    );
+    // SSM encrypts the SecureString with the account's AWS-managed key
+    // (alias/aws/ssm); scope KMS to SSM only via the ViaService condition.
+    storeClientSecretFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['kms:Encrypt', 'kms:Decrypt', 'kms:GenerateDataKey'],
+        resources: ['*'],
+        conditions: { StringEquals: { 'kms:ViaService': `ssm.${this.region}.amazonaws.com` } },
+      })
+    );
 
     // Create custom resource provider
     const storeClientSecretProvider = new cr.Provider(this, 'StoreClientSecretProvider', {
@@ -772,7 +785,7 @@ export class TokenExchangeStack extends cdk.Stack {
       properties: {
         UserPoolId: tokenExchangeUserPool.userPoolId,
         ClientId: serviceClientWithSecret.userPoolClientId,
-        ParameterName: clientSecretParameter.parameterName,
+        ParameterName: clientSecretParameterName,
       },
     });
 
@@ -804,7 +817,8 @@ export class TokenExchangeStack extends cdk.Stack {
           try {
             console.log('Fetching credentials from SSM Parameter Store');
             const command = new GetParameterCommand({
-              Name: process.env.CLIENT_SECRET_PARAMETER
+              Name: process.env.CLIENT_SECRET_PARAMETER,
+              WithDecryption: true
             });
             const response = await ssmClient.send(command);
             
@@ -820,8 +834,17 @@ export class TokenExchangeStack extends cdk.Stack {
         }
         
         exports.handler = async (event, context) => {
-          console.log('Authorizer event:', JSON.stringify(event, null, 2));
-          
+          // Do NOT log the raw event: it contains the Basic Authorization header.
+          const crypto = require('crypto');
+
+          // Constant-time comparison to avoid credential timing oracles (#5).
+          const safeEqual = (a, b) => {
+            const ab = Buffer.from(String(a));
+            const bb = Buffer.from(String(b));
+            if (ab.length !== bb.length) return false;
+            return crypto.timingSafeEqual(ab, bb);
+          };
+
           // Helper to get header case-insensitively (API Gateway may lowercase headers)
           const getHeader = (name) => {
             const lower = name.toLowerCase();
@@ -851,18 +874,16 @@ export class TokenExchangeStack extends cdk.Stack {
             const credentials = Buffer.from(authHeader, 'base64').toString('utf-8');
             const [clientId, clientSecret] = credentials.split(':');
             
-            console.log('Extracted clientId:', clientId);
-            
             const realCredentials = await getClientCredentials();
-            console.log('Expected clientId from SSM:', realCredentials.clientId);
             
-            if (clientId === realCredentials.clientId && clientSecret === realCredentials.clientSecret) {
-              console.log('Authorization successful - delegation enabled');
+            // Constant-time compare of BOTH id and secret; evaluate both before AND.
+            const idOk = safeEqual(clientId, realCredentials.clientId);
+            const secretOk = safeEqual(clientSecret, realCredentials.clientSecret);
+            if (idOk && secretOk) {
               return generatePolicy(clientId, 'Allow', event.methodArn);
-            } else {
-              console.log('Credential validation failed');
-              return generatePolicy('user', 'Deny', event.methodArn);
             }
+            console.log('Credential validation failed');
+            return generatePolicy('user', 'Deny', event.methodArn);
             
           } catch (error) {
             console.error('Authorizer error:', error);
@@ -885,13 +906,28 @@ export class TokenExchangeStack extends cdk.Stack {
         }
       `),
       environment: {
-        CLIENT_SECRET_PARAMETER: clientSecretParameter.parameterName,
+        CLIENT_SECRET_PARAMETER: clientSecretParameterName,
       },
       timeout: cdk.Duration.seconds(30),
     });
 
     // Grant SSM read permission to authorizer
-    clientSecretParameter.grantRead(authorizerFunction);
+    // Authorizer reads (and decrypts) the SecureString; scope to the exact ARN.
+    authorizerFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['ssm:GetParameter'],
+        resources: [clientSecretParameterArn],
+      })
+    );
+    authorizerFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['kms:Decrypt'],
+        resources: ['*'],
+        conditions: { StringEquals: { 'kms:ViaService': `ssm.${this.region}.amazonaws.com` } },
+      })
+    );
 
     // ========================================
     // Token Exchange Lambda
@@ -938,7 +974,7 @@ export class TokenExchangeStack extends cdk.Stack {
         }
         
         exports.handler = async (event) => {
-          console.log('Token exchange event:', JSON.stringify(event, null, 2));
+          // Do NOT log the raw event: the form body carries a live subject_token.
           
           try {
             const body = parseFormBody(event.body);
@@ -1029,7 +1065,10 @@ export class TokenExchangeStack extends cdk.Stack {
               },
               ClientMetadata: {
                 OriginalUserToken: body.subject_token,
-                TokenExchange: 'true'
+                TokenExchange: 'true',
+                // RFC 8693 optional requested scope. PreTokenGeneration bounds this
+                // to the service scope ceiling and rejects anything beyond it (#6).
+                RequestedScope: body.scope || ''
               }
             });
             
@@ -1097,7 +1136,7 @@ export class TokenExchangeStack extends cdk.Stack {
         throttlingRateLimit: 100,
         throttlingBurstLimit: 200,
         loggingLevel: apigateway.MethodLoggingLevel.INFO,
-        dataTraceEnabled: true,
+        dataTraceEnabled: false,
         metricsEnabled: true,
         accessLogDestination: new apigateway.LogGroupLogDestination(apiAccessLogGroup),
         accessLogFormat: apigateway.AccessLogFormat.jsonWithStandardFields({
@@ -1113,7 +1152,12 @@ export class TokenExchangeStack extends cdk.Stack {
         }),
       },
       defaultCorsPreflightOptions: {
-        allowOrigins: apigateway.Cors.ALL_ORIGINS,
+        // CORS defaults to '*' for the sample demo. In production set the exact
+        // origin(s): `cdk deploy -c corsAllowOrigin=https://your-app.example.com`
+        // (security review #7).
+        allowOrigins: this.node.tryGetContext('corsAllowOrigin')
+          ? [this.node.tryGetContext('corsAllowOrigin')]
+          : apigateway.Cors.ALL_ORIGINS,
         allowMethods: apigateway.Cors.ALL_METHODS,
         allowHeaders: ['Content-Type', 'Authorization'],
       },
@@ -1188,13 +1232,13 @@ export class TokenExchangeStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, 'SSMParameterName', {
-      value: clientSecretParameter.parameterName,
+      value: clientSecretParameterName,
       description: 'SSM Parameter Store path containing service client credentials',
       exportName: `${this.stackName}-SSMParameterName`,
     });
 
     new cdk.CfnOutput(this, 'SSMParameterCommand', {
-      value: `aws ssm get-parameter --name ${clientSecretParameter.parameterName} --region ${this.region}`,
+      value: `aws ssm get-parameter --name ${clientSecretParameterName} --with-decryption --region ${this.region}`,
       description: 'Command to view stored credentials',
     });
 

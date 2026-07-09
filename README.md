@@ -418,6 +418,23 @@ Contributions are welcome! Please read our [contributing guidelines](CONTRIBUTIN
 
 This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.
 
+## Security considerations
+
+This sample implements the following controls by default:
+
+- **Secrets in SSM as `SecureString`.** The service client secret is stored encrypted (AWS-managed `alias/aws/ssm` key) and read with decryption. IAM for the authorizer and the store-secret custom resource is scoped to the exact parameter ARN, with `kms:*` constrained to SSM via the `kms:ViaService` condition.
+- **Token verification is pinned.** Inbound tokens are verified with `aws-jwt-verify`, pinned to the external user pool, client ID, and `tokenUse` (there is no issuer-only "generic" fallback). `clientMetadata` is re-verified inside the pre-token trigger because Cognito does not validate it. Verification failures fail closed (no token is issued).
+- **Least-privilege delegated scopes.** The exchanged token carries the *service's* scopes, bounded by a fixed ceiling. A caller may request a subset via the RFC 8693 `scope` parameter; anything beyond the ceiling is rejected, so the exchange can never escalate past the service's own grant. Per-user authorization is enforced downstream (see below).
+- **No secrets in logs.** Lambdas do not log raw events, tokens, or claims (only non-sensitive identifiers), and API Gateway data-trace logging is disabled.
+- **Constant-time credential comparison** in the authorizer (`crypto.timingSafeEqual`).
+
+For production deployments, also apply:
+
+- **Restrict CORS** to your application's origin. With the CDK: `cdk deploy -c corsAllowOrigin=https://your-app.example.com`.
+- **Keep the confidential client secret server-side.** The browser demo holds it client-side only to illustrate the request; perform the exchange from a backend in production.
+- **Restrict the token audience/resource** (RFC 8693 `audience`/`resource`) so exchanged tokens cannot be replayed against other downstreams, and enforce fine-grained, per-user authorization at the resource (for example with [Amazon Verified Permissions](https://aws.amazon.com/verified-permissions/)).
+- **Harden the front door**: rotate the Basic-auth client secret regularly (or move to mTLS / OAuth client-credentials), associate a **WAFv2** web ACL and explicit usage plans with the API stage, enable **MFA** on the user pools, and set Lambda **reserved concurrency**.
+
 ## References
 
 - [RFC 8693 - OAuth 2.0 Token Exchange](https://datatracker.ietf.org/doc/html/rfc8693)

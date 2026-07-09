@@ -106,6 +106,14 @@
         <label>Service Client ID</label>
         <input type="text" id="cfg-service-client-id" value="REPLACE_WITH_SERVICE_CLIENT_ID">
       </div>
+      <div class="config-field" style="border:1px solid #d13212;background:#fdf3f1;padding:10px;border-radius:6px">
+        <strong>⚠ Demo only — not a production pattern.</strong>
+        This browser demo holds the <em>confidential</em> service client secret client-side and
+        builds the Basic auth header in JavaScript solely to illustrate the exchange request. A
+        confidential client secret must live only in a backend you control — never in browser or
+        mobile code. In production, perform the token exchange from a server-side component and
+        restrict the API's CORS to that origin.
+      </div>
       <div class="config-field">
         <label>Service Client Secret</label>
         <input type="password" id="cfg-service-client-secret" value="REPLACE_WITH_YOUR_SERVICE_CLIENT_SECRET">
