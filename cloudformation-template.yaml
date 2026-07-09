@@ -740,6 +740,15 @@ Resources:
             clientId: process.env.EXTERNAL_CLIENT_ID,
           });
           
+          // Service scope ceiling — MUST match PreTokenGeneration. A requested scope
+          // outside this set is rejected up front with 400 invalid_scope.
+          const SERVICE_SCOPE_CEILING = [
+            'read:user-profile',
+            'read:user-permissions',
+            'write:audit-logs',
+            'access:downstream-apis'
+          ];
+          
           function parseFormBody(body) {
             const params = new URLSearchParams(body);
             const result = {};
@@ -767,6 +776,25 @@ Resources:
                   body: JSON.stringify({
                     error: 'unsupported_grant_type',
                     error_description: 'Only token exchange grant type is supported'
+                  }),
+                };
+              }
+              
+              // Validate optional requested scope against the service ceiling (#6):
+              // reject out-of-ceiling scopes up front with a clean 400 invalid_scope.
+              // PreTokenGeneration also enforces this as defense-in-depth.
+              const requestedScopes = (body.scope || '').split(' ').map(function (s) { return s.trim(); }).filter(Boolean);
+              const invalidScopes = requestedScopes.filter(function (s) { return SERVICE_SCOPE_CEILING.indexOf(s) === -1; });
+              if (invalidScopes.length > 0) {
+                return {
+                  statusCode: 400,
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                  },
+                  body: JSON.stringify({
+                    error: 'invalid_scope',
+                    error_description: 'Requested scope(s) not permitted for this exchange: ' + invalidScopes.join(' ')
                   }),
                 };
               }

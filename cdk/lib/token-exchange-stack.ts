@@ -963,6 +963,15 @@ export class TokenExchangeStack extends cdk.Stack {
           "urn:ietf:params:oauth:token-type:access_token",
           "urn:ietf:params:oauth:token-type:jwt",
         ];
+
+        // Service scope ceiling — MUST match PreTokenGeneration. A requested scope
+        // outside this set is rejected up front with 400 invalid_scope.
+        const SERVICE_SCOPE_CEILING = [
+          'read:user-profile',
+          'read:user-permissions',
+          'write:audit-logs',
+          'access:downstream-apis'
+        ];
         
         function parseFormBody(body) {
           const params = new URLSearchParams(body);
@@ -999,6 +1008,22 @@ export class TokenExchangeStack extends cdk.Stack {
                 body: JSON.stringify({
                   error: 'invalid_request',
                   error_description: 'Unsupported subject_token_type: ' + body.subject_token_type + '. Accepted: ' + ACCEPTED_TOKEN_TYPES.join(', ')
+                }),
+              };
+            }
+            
+            // Validate optional requested scope against the service ceiling (#6):
+            // reject out-of-ceiling scopes up front with a clean 400 invalid_scope.
+            // PreTokenGeneration also enforces this as defense-in-depth.
+            const requestedScopes = (body.scope || '').split(' ').map(s => s.trim()).filter(Boolean);
+            const invalidScopes = requestedScopes.filter(s => !SERVICE_SCOPE_CEILING.includes(s));
+            if (invalidScopes.length > 0) {
+              return {
+                statusCode: 400,
+                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+                body: JSON.stringify({
+                  error: 'invalid_scope',
+                  error_description: 'Requested scope(s) not permitted for this exchange: ' + invalidScopes.join(' ')
                 }),
               };
             }
