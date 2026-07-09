@@ -83,6 +83,7 @@ echo ""
 echo "🔑 Fetching service credentials from SSM..."
 CREDS=$(aws ssm get-parameter \
   --name "$SSM_PARAMETER" \
+  --with-decryption \
   --region "$REGION" \
   --query 'Parameter.Value' \
   --output text)
