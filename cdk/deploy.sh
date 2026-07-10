@@ -29,9 +29,9 @@ echo "🏗️  Checking CDK bootstrap..."
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 REGION=${AWS_REGION:-eu-west-1}
 
-if ! aws cloudformation describe-stacks --stack-name CDKToolkit --region $REGION &> /dev/null; then
+if ! aws cloudformation describe-stacks --stack-name CDKToolkit --region "$REGION" &> /dev/null; then
     echo "📦 Bootstrapping CDK for account $ACCOUNT in region $REGION..."
-    cdk bootstrap aws://$ACCOUNT/$REGION
+    cdk bootstrap "aws://$ACCOUNT/$REGION"
 else
     echo "✅ CDK already bootstrapped"
 fi

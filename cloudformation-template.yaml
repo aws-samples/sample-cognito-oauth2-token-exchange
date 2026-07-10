@@ -254,6 +254,11 @@ Resources:
 
   AuthorizerRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "kms:Decrypt is constrained to the SSM service via the kms:ViaService condition; the AWS-managed alias/aws/ssm key ARN is not known at author time."
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -324,6 +329,14 @@ Resources:
             comment: "Sample workload; configure reserved concurrency to your account limits in production."
           - id: "CKV_AWS_173"
             comment: "Environment variables hold only non-secret configuration (user pool / client IDs); secrets are stored in SSM SecureString. Default AWS-managed encryption is sufficient."
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "CloudWatch Logs permissions are granted via the function's execution role plus LoggingConfig; cfn_nag does not detect the role-based grant."
+          - id: W89
+            reason: "Trigger/authorizer Lambda needs public egress to the external IdP JWKS endpoint; a VPC adds NAT/endpoint cost with no security benefit for this sample."
+          - id: W92
+            reason: "Sample workload; set ReservedConcurrentExecutions to your account limits in production."
     Properties:
       FunctionName: !Sub '${AWS::StackName}-DefineAuthChallenge'
       Runtime: nodejs22.x
@@ -370,6 +383,14 @@ Resources:
             comment: "Sample workload; configure reserved concurrency to your account limits in production."
           - id: "CKV_AWS_173"
             comment: "Environment variables hold only non-secret configuration (user pool / client IDs); secrets are stored in SSM SecureString. Default AWS-managed encryption is sufficient."
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "CloudWatch Logs permissions are granted via the function's execution role plus LoggingConfig; cfn_nag does not detect the role-based grant."
+          - id: W89
+            reason: "Trigger/authorizer Lambda needs public egress to the external IdP JWKS endpoint; a VPC adds NAT/endpoint cost with no security benefit for this sample."
+          - id: W92
+            reason: "Sample workload; set ReservedConcurrentExecutions to your account limits in production."
     Properties:
       FunctionName: !Sub '${AWS::StackName}-CreateAuthChallenge'
       Runtime: nodejs22.x
@@ -412,6 +433,14 @@ Resources:
             comment: "Sample workload; configure reserved concurrency to your account limits in production."
           - id: "CKV_AWS_173"
             comment: "Environment variables hold only non-secret configuration (user pool / client IDs); secrets are stored in SSM SecureString. Default AWS-managed encryption is sufficient."
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "CloudWatch Logs permissions are granted via the function's execution role plus LoggingConfig; cfn_nag does not detect the role-based grant."
+          - id: W89
+            reason: "Trigger/authorizer Lambda needs public egress to the external IdP JWKS endpoint; a VPC adds NAT/endpoint cost with no security benefit for this sample."
+          - id: W92
+            reason: "Sample workload; set ReservedConcurrentExecutions to your account limits in production."
     Properties:
       FunctionName: !Sub '${AWS::StackName}-VerifyAuthChallenge'
       Runtime: nodejs22.x
@@ -466,6 +495,14 @@ Resources:
             comment: "Sample workload; configure reserved concurrency to your account limits in production."
           - id: "CKV_AWS_173"
             comment: "Environment variables hold only non-secret configuration (user pool / client IDs); secrets are stored in SSM SecureString. Default AWS-managed encryption is sufficient."
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "CloudWatch Logs permissions are granted via the function's execution role plus LoggingConfig; cfn_nag does not detect the role-based grant."
+          - id: W89
+            reason: "Trigger/authorizer Lambda needs public egress to the external IdP JWKS endpoint; a VPC adds NAT/endpoint cost with no security benefit for this sample."
+          - id: W92
+            reason: "Sample workload; set ReservedConcurrentExecutions to your account limits in production."
     Properties:
       FunctionName: !Sub '${AWS::StackName}-PreTokenGeneration'
       Runtime: nodejs22.x
@@ -573,6 +610,14 @@ Resources:
             comment: "Sample workload; configure reserved concurrency to your account limits in production."
           - id: "CKV_AWS_173"
             comment: "Environment variables hold only non-secret configuration (user pool / client IDs); secrets are stored in SSM SecureString. Default AWS-managed encryption is sufficient."
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "CloudWatch Logs permissions are granted via the function's execution role plus LoggingConfig; cfn_nag does not detect the role-based grant."
+          - id: W89
+            reason: "Trigger/authorizer Lambda needs public egress to the external IdP JWKS endpoint; a VPC adds NAT/endpoint cost with no security benefit for this sample."
+          - id: W92
+            reason: "Sample workload; set ReservedConcurrentExecutions to your account limits in production."
     Properties:
       FunctionName: !Sub '${AWS::StackName}-Authorizer'
       Runtime: nodejs22.x
@@ -718,6 +763,14 @@ Resources:
             comment: "Sample workload; configure reserved concurrency to your account limits in production."
           - id: "CKV_AWS_173"
             comment: "Environment variables hold only non-secret configuration (user pool / client IDs); secrets are stored in SSM SecureString. Default AWS-managed encryption is sufficient."
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "CloudWatch Logs permissions are granted via the function's execution role plus LoggingConfig; cfn_nag does not detect the role-based grant."
+          - id: W89
+            reason: "Trigger/authorizer Lambda needs public egress to the external IdP JWKS endpoint; a VPC adds NAT/endpoint cost with no security benefit for this sample."
+          - id: W92
+            reason: "Sample workload; set ReservedConcurrentExecutions to your account limits in production."
     Properties:
       FunctionName: !Sub '${AWS::StackName}-TokenExchange'
       Runtime: nodejs22.x
@@ -1006,6 +1059,14 @@ Resources:
             comment: "Sample workload; configure reserved concurrency to your account limits in production."
           - id: "CKV_AWS_173"
             comment: "Environment variables hold only non-secret configuration (user pool / client IDs); secrets are stored in SSM SecureString. Default AWS-managed encryption is sufficient."
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "CloudWatch Logs permissions are granted via the function's execution role plus LoggingConfig; cfn_nag does not detect the role-based grant."
+          - id: W89
+            reason: "Trigger/authorizer Lambda needs public egress to the external IdP JWKS endpoint; a VPC adds NAT/endpoint cost with no security benefit for this sample."
+          - id: W92
+            reason: "Sample workload; set ReservedConcurrentExecutions to your account limits in production."
     Properties:
       FunctionName: !Sub '${AWS::StackName}-CreateServiceIdentities'
       Runtime: nodejs22.x
@@ -1134,6 +1195,11 @@ Resources:
   # Custom Resource Lambda Role - Fetches secret from Cognito and stores in SSM
   StoreClientSecretRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "kms:Encrypt/Decrypt/GenerateDataKey are constrained to the SSM service via the kms:ViaService condition; the AWS-managed alias/aws/ssm key ARN is not known at author time."
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -1182,6 +1248,14 @@ Resources:
             comment: "Sample workload; configure reserved concurrency to your account limits in production."
           - id: "CKV_AWS_173"
             comment: "Environment variables hold only non-secret configuration (user pool / client IDs); secrets are stored in SSM SecureString. Default AWS-managed encryption is sufficient."
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "CloudWatch Logs permissions are granted via the function's execution role plus LoggingConfig; cfn_nag does not detect the role-based grant."
+          - id: W89
+            reason: "Trigger/authorizer Lambda needs public egress to the external IdP JWKS endpoint; a VPC adds NAT/endpoint cost with no security benefit for this sample."
+          - id: W92
+            reason: "Sample workload; set ReservedConcurrentExecutions to your account limits in production."
     Properties:
       FunctionName: !Sub '${AWS::StackName}-StoreClientSecret'
       Runtime: nodejs22.x
@@ -1435,6 +1509,11 @@ Resources:
   # API Gateway Deployment
   TokenExchangeDeployment:
     Type: AWS::ApiGateway::Deployment
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W68
+            reason: "Sample endpoint; associate an API Gateway UsagePlan and WAFv2 web ACL in production (see README Security considerations)."
     Properties:
       RestApiId: !Ref TokenExchangeApi
       StageName: v1
