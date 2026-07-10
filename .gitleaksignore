@@ -1,0 +1,10 @@
+# gitleaks false-positive allowlist.
+# Each line is a finding fingerprint (commit:file:rule:startline) that has been
+# reviewed and confirmed to be a non-secret placeholder in documentation.
+#
+# cdk/README.md example "Outputs:" block + retrieval snippet — all placeholder
+# values (fake client IDs and a "secret123..." doc placeholder), not real
+# credentials. Verified 2026-07-10.
+c3f9f89723bc7af0572b520b0f800d954469a979:cdk/README.md:generic-api-key:108
+c3f9f89723bc7af0572b520b0f800d954469a979:cdk/README.md:generic-api-key:110
+c3f9f89723bc7af0572b520b0f800d954469a979:cdk/README.md:generic-api-key:154
