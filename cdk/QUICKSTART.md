@@ -14,7 +14,7 @@ npm install -g aws-cdk
 # Verify installation
 cdk --version
 
-# Docker (required — the JWT verify layer is bundled in a container)
+# Docker (optional — used to bundle the JWT verify layer when npm is unavailable)
 docker --version
 ```
 
@@ -70,7 +70,10 @@ This removes all stack resources. The Lambda layer is part of the stack, so noth
 
 ### Error: "Cannot find module 'aws-jwt-verify'"
 
-Docker wasn't available during `cdk deploy`, so the layer was built without dependencies. Verify Docker is running (`docker ps`) and redeploy.
+The layer was staged without its dependencies. The layer asset is bundled at synth
+time, which runs `npm ci` in `lambda-layers/jwt-verify/nodejs` on the host and falls
+back to a Docker image if npm is unavailable. Re-run `cdk deploy`; if the host has no
+npm, verify Docker is running (`docker ps`).
 
 ### Error: "Custom Resource failed"
 
