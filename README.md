@@ -121,7 +121,7 @@ This design ensures high performance and scalability while maintaining security 
 
 ## Deployment Options
 
-> **Important**: This package includes two deployment options that create identical infrastructure. **You only need to deploy one of them.** Choose whichever fits your team's workflow.
+> **Important**: This package includes two deployment options that deploy the same architecture. **You only need to deploy one of them.** Choose whichever fits your team's workflow. They are not byte-for-byte equivalent; see [Differences between the two options](#differences-between-the-two-options).
 
 | | Option A: CloudFormation | Option B: CDK (TypeScript) |
 |---|---|---|
@@ -130,6 +130,21 @@ This design ensures high performance and scalability while maintaining security 
 | **Prerequisites** | AWS CLI only | AWS CLI + Node.js 18+ + CDK CLI |
 | **Customization** | Edit YAML template | Edit TypeScript, full IDE support |
 | **Build step** | None | `npm run build` (handled by deploy script) |
+
+#### Differences between the two options
+
+Both options deploy the same Cognito pools, Lambda triggers, custom authorizer and
+API Gateway endpoint. The remaining differences are mechanical rather than
+behavioral:
+
+| | CloudFormation | CDK |
+|---|---|---|
+| **Lambda layer** | Built by `deploy-cloudformation.sh`, uploaded to an S3 bucket, referenced by the `LambdaLayerBucket` parameter | Staged as a CDK asset at synth time |
+| **Access log fields** | Space-delimited: request ID, time, method, path, status, length | JSON, additionally including source IP, caller, user and protocol |
+| **Resource count** | 42 resources | 55; the extra ones are CDK custom-resource providers, their roles, and inline policies emitted as separate `AWS::IAM::Policy` resources |
+
+If you need to know exactly what a given option creates, `cdk synth` and the
+template are both readable, and `deploy-cloudformation.sh` shows the layer build.
 
 ### Option A: AWS CloudFormation (YAML)
 
