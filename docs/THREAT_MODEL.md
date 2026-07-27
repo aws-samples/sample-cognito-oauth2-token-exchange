@@ -80,7 +80,7 @@
 - Deployers run on the Essentials/Plus Cognito feature plan (required for access-token customization).
 
 ## Subject-token type note
-The CDK stack accepts both **access** and **ID** subject tokens (MCP 3LO and AgentCore OBO respectively); every verifier pins client ID + `tokenUse`, and PreTokenGeneration verifies whichever type arrived, so the delegated-claims path works end-to-end for both (resolves the review's ID-token inconsistency). The CloudFormation template is intentionally **access-token-only** and internally consistent.
+Both stacks accept **access** and **ID** subject tokens (MCP 3LO and AgentCore OBO respectively); every verifier pins client ID + `tokenUse`, and PreTokenGeneration verifies whichever type arrived, so the delegated-claims path works end-to-end for both (resolves the review's ID-token inconsistency).
 
 ## Security review resolution (2026-07-09)
 External security review findings addressed in code:
