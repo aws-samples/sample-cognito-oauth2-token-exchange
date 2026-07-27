@@ -13,6 +13,15 @@ Parameters:
       When false, the exchanged token will be a standard Cognito token without
       original user identity claims or custom service scopes.
 
+  CorsAllowOrigin:
+    Type: String
+    Default: '*'
+    Description: >-
+      Value returned in the Access-Control-Allow-Origin header, for both the CORS
+      preflight response and the token-exchange responses. Defaults to '*' for the
+      sample demo; set the exact origin (for example https://your-app.example.com)
+      in production.
+
   LambdaLayerBucket:
     Type: String
     Description: >-
@@ -818,6 +827,10 @@ Resources:
           
           const cognitoClient = new CognitoIdentityProviderClient({ region: process.env.AWS_REGION });
           
+          // Mirrors the API's CORS preflight origin, so a configured origin applies to
+          // the actual responses too and not only to the OPTIONS preflight.
+          const CORS_ORIGIN = process.env.CORS_ALLOW_ORIGIN || '*';
+          
           // Verifier for Cognito ACCESS tokens (MCP 3LO path).
           const accessVerifier = CognitoJwtVerifier.create({
             userPoolId: process.env.EXTERNAL_USER_POOL_ID,
@@ -868,7 +881,7 @@ Resources:
                   statusCode: 400,
                   headers: {
                     'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Origin': CORS_ORIGIN,
                   },
                   body: JSON.stringify({
                     error: 'unsupported_grant_type',
@@ -882,7 +895,7 @@ Resources:
                   statusCode: 400,
                   headers: {
                     'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Origin': CORS_ORIGIN,
                   },
                   body: JSON.stringify({
                     error: 'invalid_request',
@@ -901,7 +914,7 @@ Resources:
                   statusCode: 400,
                   headers: {
                     'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Origin': CORS_ORIGIN,
                   },
                   body: JSON.stringify({
                     error: 'invalid_scope',
@@ -925,7 +938,7 @@ Resources:
                   statusCode: 401,
                   headers: {
                     'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Origin': CORS_ORIGIN,
                   },
                   body: JSON.stringify({
                     error: 'invalid_grant',
@@ -989,7 +1002,7 @@ Resources:
                 statusCode: 200,
                 headers: {
                   'Content-Type': 'application/json',
-                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Origin': CORS_ORIGIN,
                 },
                 body: JSON.stringify({
                   access_token: challengeResponse.AuthenticationResult.AccessToken,
@@ -1005,7 +1018,7 @@ Resources:
                 statusCode: 500,
                 headers: {
                   'Content-Type': 'application/json',
-                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Origin': CORS_ORIGIN,
                 },
                 body: JSON.stringify({
                   error: 'server_error',
@@ -1020,6 +1033,7 @@ Resources:
           EXTERNAL_CLIENT_ID: !Ref ExternalIdpUserPoolClient
           USER_POOL_ID: !Ref TokenExchangeUserPool
           ADMIN_CLIENT_ID: !Ref AdminClientWithoutSecret
+          CORS_ALLOW_ORIGIN: !Ref CorsAllowOrigin
       Timeout: 30
 
   # Cognito User Pool (created after Lambda functions)
@@ -1557,7 +1571,7 @@ Resources:
             ResponseParameters:
               method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
               method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
-              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${CorsAllowOrigin}'"
             ResponseTemplates:
               application/json: ''
         RequestTemplates:

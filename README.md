@@ -430,7 +430,7 @@ This sample implements the following controls by default:
 
 For production deployments, also apply:
 
-- **Restrict CORS** to your application's origin. With the CDK: `cdk deploy -c corsAllowOrigin=https://your-app.example.com`.
+- **Restrict CORS** to your application's origin. With the CDK: `cdk deploy -c corsAllowOrigin=https://your-app.example.com`. With CloudFormation, pass the `CorsAllowOrigin` parameter. Either way the origin applies to the preflight response and to the token-exchange responses.
 - **Keep the confidential client secret server-side.** The browser demo holds it client-side only to illustrate the request; perform the exchange from a backend in production.
 - **Restrict the token audience/resource** (RFC 8693 `audience`/`resource`) so exchanged tokens cannot be replayed against other downstreams, and enforce fine-grained, per-user authorization at the resource (for example with [Amazon Verified Permissions](https://aws.amazon.com/verified-permissions/)).
 - **Harden the front door**: rotate the Basic-auth client secret regularly (or move to mTLS / OAuth client-credentials), associate a **WAFv2** web ACL and explicit usage plans with the API stage, enable **MFA** on the user pools, and set Lambda **reserved concurrency**.

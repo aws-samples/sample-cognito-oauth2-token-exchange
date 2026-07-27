@@ -24,6 +24,11 @@ export class TokenExchangeStack extends cdk.Stack {
     // Usage: cdk deploy -c enableDelegationClaims=false
     const enableDelegationClaims = this.node.tryGetContext('enableDelegationClaims') !== 'false';
 
+    // CORS origin for both the preflight response and the Lambda responses.
+    // Defaults to '*' for the sample demo; set the exact origin in production:
+    //   cdk deploy -c corsAllowOrigin=https://your-app.example.com
+    const corsAllowOrigin: string = this.node.tryGetContext('corsAllowOrigin') ?? '*';
+
     // Suppress cdk-nag findings for optional paid features and design decisions
     NagSuppressions.addStackSuppressions(this, [
       {
@@ -976,6 +981,10 @@ export class TokenExchangeStack extends cdk.Stack {
         
         const cognitoClient = new CognitoIdentityProviderClient({ region: process.env.AWS_REGION });
         
+        // Mirrors the API's CORS preflight origin, so a configured origin applies to
+        // the actual responses too and not only to the OPTIONS preflight.
+        const CORS_ORIGIN = process.env.CORS_ALLOW_ORIGIN || '*';
+        
         // Verifier for Cognito access tokens (original)
         const accessVerifier = CognitoJwtVerifier.create({
           userPoolId: process.env.EXTERNAL_USER_POOL_ID,
@@ -1024,7 +1033,7 @@ export class TokenExchangeStack extends cdk.Stack {
             if (body.grant_type !== "urn:ietf:params:oauth:grant-type:token-exchange") {
               return {
                 statusCode: 400,
-                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': CORS_ORIGIN },
                 body: JSON.stringify({
                   error: 'unsupported_grant_type',
                   error_description: 'Only token exchange grant type is supported'
@@ -1036,7 +1045,7 @@ export class TokenExchangeStack extends cdk.Stack {
             if (!ACCEPTED_TOKEN_TYPES.includes(body.subject_token_type)) {
               return {
                 statusCode: 400,
-                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': CORS_ORIGIN },
                 body: JSON.stringify({
                   error: 'invalid_request',
                   error_description: 'Unsupported subject_token_type: ' + body.subject_token_type + '. Accepted: ' + ACCEPTED_TOKEN_TYPES.join(', ')
@@ -1052,7 +1061,7 @@ export class TokenExchangeStack extends cdk.Stack {
             if (invalidScopes.length > 0) {
               return {
                 statusCode: 400,
-                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': CORS_ORIGIN },
                 body: JSON.stringify({
                   error: 'invalid_scope',
                   error_description: 'Requested scope(s) not permitted for this exchange: ' + invalidScopes.join(' ')
@@ -1074,7 +1083,7 @@ export class TokenExchangeStack extends cdk.Stack {
                 console.error('Token verification failed for both types:', accessErr.message, idErr.message);
                 return {
                   statusCode: 401,
-                  headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+                  headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': CORS_ORIGIN },
                   body: JSON.stringify({
                     error: 'invalid_grant',
                     error_description: 'The provided subject token is invalid or expired'
@@ -1135,7 +1144,7 @@ export class TokenExchangeStack extends cdk.Stack {
               statusCode: 200,
               headers: {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Origin': CORS_ORIGIN,
               },
               body: JSON.stringify({
                 access_token: challengeResponse.AuthenticationResult.AccessToken,
@@ -1151,7 +1160,7 @@ export class TokenExchangeStack extends cdk.Stack {
               statusCode: 500,
               headers: {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Origin': CORS_ORIGIN,
               },
               body: JSON.stringify({
                 error: 'server_error',
@@ -1166,6 +1175,7 @@ export class TokenExchangeStack extends cdk.Stack {
         EXTERNAL_CLIENT_ID: externalIdpClient.userPoolClientId,
         USER_POOL_ID: tokenExchangeUserPool.userPoolId,
         ADMIN_CLIENT_ID: adminClientWithoutSecret.userPoolClientId,
+        CORS_ALLOW_ORIGIN: corsAllowOrigin,
       },
       timeout: cdk.Duration.seconds(30),
     });
@@ -1216,11 +1226,9 @@ export class TokenExchangeStack extends cdk.Stack {
         }),
       },
       defaultCorsPreflightOptions: {
-        // CORS defaults to '*' for the sample demo. In production set the exact
-        // origin(s): `cdk deploy -c corsAllowOrigin=https://your-app.example.com`.
-        allowOrigins: this.node.tryGetContext('corsAllowOrigin')
-          ? [this.node.tryGetContext('corsAllowOrigin')]
-          : apigateway.Cors.ALL_ORIGINS,
+        // Same origin as the Lambda responses, so a configured origin applies
+        // end-to-end and not only to the OPTIONS preflight.
+        allowOrigins: [corsAllowOrigin],
         allowMethods: apigateway.Cors.ALL_METHODS,
         allowHeaders: ['Content-Type', 'Authorization'],
       },
