@@ -32,17 +32,18 @@ echo "📦 Building Lambda layer with aws-jwt-verify..."
 rm -rf lambda-layer-build
 mkdir -p lambda-layer-build/nodejs
 
-cat > lambda-layer-build/nodejs/package.json << 'EOF'
-{
-  "name": "jwt-verify-layer",
-  "version": "1.0.0",
-  "dependencies": {
-    "aws-jwt-verify": "^5.2.1"
-  }
-}
-EOF
+# Reuse the manifest and lockfile the CDK path uses, so both deployment options
+# install the same aws-jwt-verify version. Writing a fresh package.json here and
+# running `npm install` without a lockfile resolved to whatever 5.x was current
+# at deploy time.
+LAYER_SRC="cdk/lambda-layers/jwt-verify/nodejs"
+if [ ! -f "$LAYER_SRC/package-lock.json" ]; then
+  echo "Missing $LAYER_SRC/package-lock.json; cannot pin the layer dependency" >&2
+  exit 1
+fi
+cp "$LAYER_SRC/package.json" "$LAYER_SRC/package-lock.json" lambda-layer-build/nodejs/
 
-(cd lambda-layer-build/nodejs && npm install --production --silent)
+(cd lambda-layer-build/nodejs && npm ci --omit=dev --silent)
 
 # Create the layer zip
 (cd lambda-layer-build && zip -rq ../jwt-verify.zip .)
