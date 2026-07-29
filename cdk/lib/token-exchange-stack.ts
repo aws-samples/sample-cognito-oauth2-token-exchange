@@ -8,6 +8,9 @@ import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as cr from 'aws-cdk-lib/custom-resources';
 import { NagSuppressions } from 'cdk-nag';
+import * as path from 'path';
+import { execSync } from 'child_process';
+import { cpSync } from 'fs';
 
 export class TokenExchangeStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -193,11 +196,40 @@ export class TokenExchangeStack extends cdk.Stack {
     // ========================================
     // Bundle the layer at synth time — installs aws-jwt-verify into nodejs/node_modules
     // so the layer zip is self-contained. Avoids shipping node_modules in the source tree.
+    //
+    // node_modules is gitignored, so a fresh clone has only package.json here. The
+    // bundling block below runs `npm ci` while staging the asset; without it the zip
+    // contains just the manifest and every Lambda that uses the layer fails at import
+    // with "Cannot find module 'aws-jwt-verify'". `local` runs npm on the host when
+    // available and falls back to the Docker image otherwise.
     const jwtVerifyLayer = new lambda.LayerVersion(this, 'JwtVerifyLayer', {
       layerVersionName: 'jwt-verify-layer',
       description: 'AWS JWT Verify library for token validation',
       compatibleRuntimes: [lambda.Runtime.NODEJS_22_X, lambda.Runtime.NODEJS_20_X],
-      code: lambda.Code.fromAsset('lambda-layers/jwt-verify'),
+      code: lambda.Code.fromAsset('lambda-layers/jwt-verify', {
+        bundling: {
+          image: lambda.Runtime.NODEJS_22_X.bundlingImage,
+          command: [
+            'bash', '-c',
+            'cd nodejs && npm ci --omit=dev && cd .. && cp -r . /asset-output',
+          ],
+          local: {
+            tryBundle(outputDir: string) {
+              const src = path.join(__dirname, '..', 'lambda-layers', 'jwt-verify');
+              try {
+                execSync('npm ci --omit=dev', {
+                  cwd: path.join(src, 'nodejs'),
+                  stdio: 'inherit',
+                });
+              } catch {
+                return false; // fall back to Docker bundling
+              }
+              cpSync(src, outputDir, { recursive: true });
+              return true;
+            },
+          },
+        },
+      }),
     });
 
     // ========================================
