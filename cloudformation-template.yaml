@@ -480,7 +480,7 @@ Resources:
           // Both verifiers are pinned to this user pool + client + tokenUse. There is
           // deliberately NO issuer-only "generic" fallback: accepting any JWT from the
           // issuer without pinning audience/client/tokenUse would open a confused-deputy
-          // gap (security review S1/#3).
+          // gap.
 
           exports.handler = async (event, context) => {
             // Do NOT log the raw event or challengeAnswer: it is a live bearer token.
@@ -552,7 +552,7 @@ Resources:
 
           // The subject (user) token may be an ACCESS token (MCP 3LO) or an ID token
           // (AgentCore OBO). Verify against BOTH, each pinned to the external pool +
-          // client + tokenUse. No issuer-only fallback (security review #3).
+          // client + tokenUse. No issuer-only fallback.
           // aws-jwt-verify caches the IdP JWKS after the first fetch.
           const accessVerifier = CognitoJwtVerifier.create({
             userPoolId: process.env.EXTERNAL_USER_POOL_ID,
