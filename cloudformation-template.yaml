@@ -453,18 +453,37 @@ Resources:
       Code:
         ZipFile: |
           const { CognitoJwtVerifier } = require('aws-jwt-verify');
-          
-          const verifier = CognitoJwtVerifier.create({
+
+          // Verifier for Cognito ACCESS tokens (MCP 3LO path).
+          const accessVerifier = CognitoJwtVerifier.create({
             userPoolId: process.env.EXTERNAL_USER_POOL_ID,
             tokenUse: "access",
             clientId: process.env.EXTERNAL_CLIENT_ID,
           });
-          
+
+          // Verifier for Cognito ID tokens (AgentCore Identity OBO path).
+          const idVerifier = CognitoJwtVerifier.create({
+            userPoolId: process.env.EXTERNAL_USER_POOL_ID,
+            tokenUse: "id",
+            clientId: process.env.EXTERNAL_CLIENT_ID,
+          });
+
+          // Both verifiers are pinned to this user pool + client + tokenUse. There is
+          // deliberately NO issuer-only "generic" fallback: accepting any JWT from the
+          // issuer without pinning audience/client/tokenUse would open a confused-deputy
+          // gap (security review S1/#3).
+
           exports.handler = async (event, context) => {
             // Do NOT log the raw event or challengeAnswer: it is a live bearer token.
             try {
               const userToken = event.request.challengeAnswer;
-              const payload = await verifier.verify(userToken);
+              let payload;
+              try {
+                payload = await accessVerifier.verify(userToken);
+              } catch (accessErr) {
+                // Fall back to ID token (both are pinned to client + tokenUse).
+                payload = await idVerifier.verify(userToken);
+              }
               // Log only a non-sensitive identifier, never the token or full claims.
               console.log('Subject token verified for sub:', payload.sub);
               event.response.answerCorrect = true;
@@ -522,11 +541,18 @@ Resources:
         ZipFile: |
           const { CognitoJwtVerifier } = require('aws-jwt-verify');
 
-          // Verifier for the EXTERNAL IdP that issued the user's (subject) token.
+          // The subject (user) token may be an ACCESS token (MCP 3LO) or an ID token
+          // (AgentCore OBO). Verify against BOTH, each pinned to the external pool +
+          // client + tokenUse. No issuer-only fallback (security review #3).
           // aws-jwt-verify caches the IdP JWKS after the first fetch.
-          const verifier = CognitoJwtVerifier.create({
+          const accessVerifier = CognitoJwtVerifier.create({
             userPoolId: process.env.EXTERNAL_USER_POOL_ID,
             tokenUse: "access",
+            clientId: process.env.EXTERNAL_CLIENT_ID,
+          });
+          const idVerifier = CognitoJwtVerifier.create({
+            userPoolId: process.env.EXTERNAL_USER_POOL_ID,
+            tokenUse: "id",
             clientId: process.env.EXTERNAL_CLIENT_ID,
           });
 
@@ -550,7 +576,12 @@ Resources:
                 // SECURITY: clientMetadata is caller-supplied and is NOT validated by
                 // Cognito. Verify the token before trusting any claim; verify() throws
                 // on failure, aborting token issuance (fail closed) via the catch.
-                const payload = await verifier.verify(md.OriginalUserToken);
+                let payload;
+                try {
+                  payload = await accessVerifier.verify(md.OriginalUserToken);
+                } catch (accessErr) {
+                  payload = await idVerifier.verify(md.OriginalUserToken);
+                }
                 console.log('Verified original user token for sub:', payload.sub);
 
                 // SECURITY (E1): bound granted scopes to the service ceiling. A caller
@@ -787,12 +818,26 @@ Resources:
           
           const cognitoClient = new CognitoIdentityProviderClient({ region: process.env.AWS_REGION });
           
-          const verifier = CognitoJwtVerifier.create({
+          // Verifier for Cognito ACCESS tokens (MCP 3LO path).
+          const accessVerifier = CognitoJwtVerifier.create({
             userPoolId: process.env.EXTERNAL_USER_POOL_ID,
             tokenUse: "access",
             clientId: process.env.EXTERNAL_CLIENT_ID,
           });
+
+          // Verifier for Cognito ID tokens (AgentCore Identity OBO path).
+          const idVerifier = CognitoJwtVerifier.create({
+            userPoolId: process.env.EXTERNAL_USER_POOL_ID,
+            tokenUse: "id",
+            clientId: process.env.EXTERNAL_CLIENT_ID,
+          });
           
+          // Accepted subject_token_types (RFC 8693)
+          const ACCEPTED_TOKEN_TYPES = [
+            "urn:ietf:params:oauth:token-type:access_token",
+            "urn:ietf:params:oauth:token-type:jwt",
+          ];
+
           // Service scope ceiling — MUST match PreTokenGeneration. A requested scope
           // outside this set is rejected up front with 400 invalid_scope.
           const SERVICE_SCOPE_CEILING = [
@@ -818,8 +863,7 @@ Resources:
               const body = parseFormBody(event.body);
               
               // Validate OAuth 2.0 Token Exchange parameters
-              if (body.grant_type !== "urn:ietf:params:oauth:grant-type:token-exchange" ||
-                  body.subject_token_type !== "urn:ietf:params:oauth:token-type:access_token") {
+              if (body.grant_type !== "urn:ietf:params:oauth:grant-type:token-exchange") {
                 return {
                   statusCode: 400,
                   headers: {
@@ -829,6 +873,20 @@ Resources:
                   body: JSON.stringify({
                     error: 'unsupported_grant_type',
                     error_description: 'Only token exchange grant type is supported'
+                  }),
+                };
+              }
+
+              if (!ACCEPTED_TOKEN_TYPES.includes(body.subject_token_type)) {
+                return {
+                  statusCode: 400,
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                  },
+                  body: JSON.stringify({
+                    error: 'invalid_request',
+                    error_description: 'Unsupported subject_token_type: ' + body.subject_token_type + '. Accepted: ' + ACCEPTED_TOKEN_TYPES.join(', ')
                   }),
                 };
               }
@@ -855,7 +913,12 @@ Resources:
               // Verify Client A's access token (subject_token)
               let payload;
               try {
-                payload = await verifier.verify(body.subject_token);
+                try {
+                  payload = await accessVerifier.verify(body.subject_token);
+                } catch (accessErr) {
+                  // Fall back to ID token (both are pinned to client + tokenUse).
+                  payload = await idVerifier.verify(body.subject_token);
+                }
               } catch (error) {
                 console.error('Token verification failed:', error);
                 return {
