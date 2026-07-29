@@ -1188,6 +1188,13 @@ export class TokenExchangeStack extends cdk.Stack {
     const api = new apigateway.RestApi(this, 'TokenExchangeApi', {
       restApiName: 'OAuth2 Token Exchange API',
       description: 'API for OAuth 2.0 token exchange using Cognito',
+      // Match cloudformation-template.yaml, which pins REGIONAL. Without this the
+      // CDK default (EDGE) fronts the API with a CloudFront distribution, giving
+      // the two deployment paths different latency, certificate and WAF-attachment
+      // behavior for the same sample.
+      endpointConfiguration: {
+        types: [apigateway.EndpointType.REGIONAL],
+      },
       deployOptions: {
         stageName: 'v1',
         throttlingRateLimit: 100,
