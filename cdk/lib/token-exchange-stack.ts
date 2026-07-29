@@ -285,7 +285,7 @@ export class TokenExchangeStack extends cdk.Stack {
         // NOTE: verification is pinned to this user pool + client + tokenUse.
         // There is deliberately NO issuer-only "generic" fallback: accepting any
         // JWT from the issuer without pinning audience/client/tokenUse would open a
-        // confused-deputy / token-passthrough gap (security review S1/#3).
+        // confused-deputy / token-passthrough gap.
 
         exports.handler = async (event, context) => {
           // Do NOT log the raw event or challengeAnswer: it is a live bearer token.
@@ -332,7 +332,7 @@ export class TokenExchangeStack extends cdk.Stack {
 
         // The subject (user) token may be an ACCESS token (MCP 3LO) or an ID token
         // (AgentCore OBO). Verify against BOTH, each pinned to the external pool +
-        // client + tokenUse. No issuer-only fallback (security review #3).
+        // client + tokenUse. No issuer-only fallback.
         const accessVerifier = CognitoJwtVerifier.create({
           userPoolId: process.env.EXTERNAL_USER_POOL_ID,
           tokenUse: "access",
@@ -1178,8 +1178,7 @@ export class TokenExchangeStack extends cdk.Stack {
       },
       defaultCorsPreflightOptions: {
         // CORS defaults to '*' for the sample demo. In production set the exact
-        // origin(s): `cdk deploy -c corsAllowOrigin=https://your-app.example.com`
-        // (security review #7).
+        // origin(s): `cdk deploy -c corsAllowOrigin=https://your-app.example.com`.
         allowOrigins: this.node.tryGetContext('corsAllowOrigin')
           ? [this.node.tryGetContext('corsAllowOrigin')]
           : apigateway.Cors.ALL_ORIGINS,
